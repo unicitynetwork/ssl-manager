@@ -40,6 +40,7 @@ readonly LOG_PREFIX="[${SCRIPT_NAME}]"
 : "${APP_HTTP_PORT:=0}"
 : "${HAPROXY_API_PORT:=8404}"
 : "${SSL_SKIP_VERIFY:=false}"
+: "${SSL_ALIAS_PROXY_PORT:=8444}"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -86,6 +87,26 @@ if [[ -z "${SSL_DOMAIN:-}" ]]; then
 fi
 
 log "Starting SSL setup for domain: ${SSL_DOMAIN}"
+
+# Parse domain aliases into an array
+ALL_SSL_DOMAINS=("$SSL_DOMAIN")
+if [[ -n "${SSL_DOMAIN_ALIASES:-}" ]]; then
+    IFS=',' read -ra _aliases <<< "$SSL_DOMAIN_ALIASES"
+    for _alias in "${_aliases[@]}"; do
+        _alias=$(echo "$_alias" | xargs)  # trim whitespace
+        # Skip empty, duplicates, and alias=primary
+        if [[ -n "$_alias" && "$_alias" != "$SSL_DOMAIN" ]]; then
+            local_dup=false
+            for _existing in "${ALL_SSL_DOMAINS[@]}"; do
+                if [[ "$_existing" == "$_alias" ]]; then local_dup=true; break; fi
+            done
+            if [[ "$local_dup" == "false" ]]; then
+                ALL_SSL_DOMAINS+=("$_alias")
+            fi
+        fi
+    done
+    log "Domain aliases: ${ALL_SSL_DOMAINS[*]:1}"
+fi
 
 if [[ "${SSL_TEST_MODE}" == "true" ]]; then
     warn "SSL_TEST_MODE is active — using self-signed certificate"
@@ -241,6 +262,40 @@ if [[ -n "$HAPROXY_DETECTED" ]]; then
     if [[ "$registered" != "true" ]]; then
         die 13 "HAProxy registration failed after ${total_waited}s of retries"
     fi
+
+    # Register alias domains with HAProxy (HTTP-only)
+    for _alias_domain in "${ALL_SSL_DOMAINS[@]:1}"; do
+        ALIAS_PAYLOAD=$(jq -n \
+            --arg domain "$_alias_domain" \
+            --arg container "$(hostname)" \
+            --argjson http_port 80 \
+            --argjson extra_ports "${EXTRA_PORTS:-null}" \
+            '{domain: $domain, container: $container, http_port: $http_port, https_port: null, extra_ports: $extra_ports}')
+
+        _alias_registered=false
+        for _attempt in 1 2 3; do
+            _code=$(curl -s -o /dev/null -w '%{http_code}' \
+                -X POST "${haproxy_url}" \
+                -H "Content-Type: application/json" \
+                "${AUTH_HEADER_ARGS[@]}" \
+                -d "$ALIAS_PAYLOAD" 2>/dev/null) || _code="000"
+
+            if [[ "$_code" == "200" || "$_code" == "201" ]]; then
+                log "Registered alias ${_alias_domain} with HAProxy (HTTP-only)"
+                _alias_registered=true
+                break
+            elif [[ "$_code" == "409" ]]; then
+                curl -s -o /dev/null -X DELETE "${haproxy_url}/${_alias_domain}" \
+                    "${AUTH_HEADER_ARGS[@]}" --max-time 5 2>/dev/null || true
+                sleep 2
+            else
+                sleep 2
+            fi
+        done
+        if [[ "$_alias_registered" != "true" ]]; then
+            die 13 "HAProxy registration failed for alias ${_alias_domain} (status=${_code})"
+        fi
+    done
 fi
 
 # ---------------------------------------------------------------------------
@@ -271,6 +326,35 @@ if [[ "$NONCE_MATCHED" != "true" ]]; then
     die 10 "Domain ${SSL_DOMAIN} is not routable to this container. Expected nonce: ${NONCE}, got: ${RESPONSE:-<no response>}"
 fi
 log "Domain reachability confirmed"
+
+# Allow HAProxy time to reload after alias registrations
+if [[ ${#ALL_SSL_DOMAINS[@]} -gt 1 ]]; then
+    log "Waiting 5s for HAProxy to reload with alias routes..."
+    sleep 5
+fi
+
+# Verify alias domains
+for _alias_domain in "${ALL_SSL_DOMAINS[@]:1}"; do
+    _ALIAS_NONCE=$(openssl rand -hex 16)
+    log "Verifying alias reachability: ${_alias_domain}"
+    curl -sf -X POST "http://localhost:80/_ssl/nonce/${_ALIAS_NONCE}" >/dev/null
+
+    _ALIAS_MATCHED=false
+    for _attempt in 1 2 3; do
+        _RESP=$(curl -sf --max-time 10 "http://${_alias_domain}/_ssl/nonce/${_ALIAS_NONCE}" 2>/dev/null) || _RESP=""
+        if [[ "$_RESP" == "$_ALIAS_NONCE" ]]; then
+            _ALIAS_MATCHED=true
+            break
+        fi
+        sleep 5
+    done
+    curl -sf -X DELETE "http://localhost:80/_ssl/nonce/${_ALIAS_NONCE}" >/dev/null 2>&1 || true
+
+    if [[ "$_ALIAS_MATCHED" != "true" ]]; then
+        die 10 "Alias domain ${_alias_domain} is not routable to this container"
+    fi
+    log "Alias reachability confirmed: ${_alias_domain}"
+done
 
 # ---------------------------------------------------------------------------
 # Step 4: Certificate check and acquisition
@@ -347,6 +431,64 @@ if [[ ! -f "$CERT_FILE" ]] || [[ ! -f "$KEY_FILE" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Step 4b: Acquire certificates for alias domains
+# ---------------------------------------------------------------------------
+for _alias_domain in "${ALL_SSL_DOMAINS[@]:1}"; do
+    _ALIAS_CERT_DIR="/etc/letsencrypt/live/${_alias_domain}"
+    _ALIAS_CERT="${_ALIAS_CERT_DIR}/fullchain.pem"
+    _ALIAS_KEY="${_ALIAS_CERT_DIR}/privkey.pem"
+    _alias_need_cert=true
+
+    if [[ -f "$_ALIAS_CERT" ]] && [[ -f "$_ALIAS_KEY" ]]; then
+        _EXPIRY_RAW=$(openssl x509 -enddate -noout -in "$_ALIAS_CERT" | cut -d= -f2)
+        _EXPIRY_EPOCH=$(date -d "$_EXPIRY_RAW" +%s)
+        _NOW_EPOCH=$(date +%s)
+        _DAYS_LEFT=$(( (_EXPIRY_EPOCH - _NOW_EPOCH) / 86400 ))
+        if [[ "$_DAYS_LEFT" -gt "$SSL_CERT_RENEW_DAYS" ]]; then
+            log "Alias ${_alias_domain}: cert valid for ${_DAYS_LEFT} days, reusing"
+            _alias_need_cert=false
+        fi
+    fi
+
+    if [[ "$_alias_need_cert" == "true" ]]; then
+        if [[ "${SSL_TEST_MODE}" == "true" ]]; then
+            log "Generating self-signed certificate for alias: ${_alias_domain}"
+            mkdir -p "$_ALIAS_CERT_DIR"
+            openssl req -x509 -newkey rsa:2048 -nodes \
+                -keyout "$_ALIAS_KEY" -out "$_ALIAS_CERT" \
+                -days 365 -subj "/CN=${_alias_domain}" 2>/dev/null
+            chmod 600 "$_ALIAS_KEY"
+        else
+            log "Requesting certificate for alias: ${_alias_domain}"
+            _certbot_alias_args=(
+                certonly --non-interactive --agree-tos
+                --webroot --webroot-path "$WEBROOT"
+                -d "${_alias_domain}"
+            )
+            if [[ -n "${SSL_ADMIN_EMAIL:-}" ]]; then
+                _certbot_alias_args+=(--email "$SSL_ADMIN_EMAIL")
+            else
+                _certbot_alias_args+=(--register-unsafely-without-email)
+            fi
+            if [[ "${SSL_STAGING}" == "true" ]]; then
+                _certbot_alias_args+=(--staging)
+            fi
+
+            if ! certbot "${_certbot_alias_args[@]}" 2>&1 | tee /tmp/certbot-alias.log; then
+                err "certbot failed for alias ${_alias_domain}"
+                cat /tmp/certbot-alias.log >&2
+                die 11 "Certificate acquisition failed for alias ${_alias_domain}"
+            fi
+            log "Certificate acquired for alias: ${_alias_domain}"
+        fi
+    fi
+
+    if [[ ! -f "$_ALIAS_CERT" ]] || [[ ! -f "$_ALIAS_KEY" ]]; then
+        die 11 "Certificate files not found for alias ${_alias_domain}"
+    fi
+done
+
+# ---------------------------------------------------------------------------
 # Step 5: TLS verification
 # ---------------------------------------------------------------------------
 if [[ "${SSL_SKIP_VERIFY}" != "true" ]]; then
@@ -370,16 +512,46 @@ if [[ "${SSL_SKIP_VERIFY}" != "true" ]]; then
         die 12 "TLS verification failed — certificate may be invalid"
     fi
     log "TLS verification passed: ${VERIFY_RESULT}"
+
+    # Verify alias certificates
+    for _alias_domain in "${ALL_SSL_DOMAINS[@]:1}"; do
+        _ALIAS_CERT="/etc/letsencrypt/live/${_alias_domain}/fullchain.pem"
+        _ALIAS_KEY="/etc/letsencrypt/live/${_alias_domain}/privkey.pem"
+
+        log "Verifying TLS certificate for alias: ${_alias_domain}"
+        kill "$TLS_TEST_PID" 2>/dev/null || true
+        wait "$TLS_TEST_PID" 2>/dev/null || true
+
+        openssl s_server -cert "$_ALIAS_CERT" -key "$_ALIAS_KEY" \
+            -accept 8443 -www -quiet &
+        TLS_TEST_PID=$!
+        sleep 1
+
+        _ALIAS_VERIFY=$(printf '' | openssl s_client -connect localhost:8443 \
+            -servername "${_alias_domain}" 2>/dev/null \
+            | openssl x509 -noout -subject 2>/dev/null) || _ALIAS_VERIFY=""
+
+        kill "$TLS_TEST_PID" 2>/dev/null || true
+        wait "$TLS_TEST_PID" 2>/dev/null || true
+        TLS_TEST_PID=""
+
+        if [[ -z "$_ALIAS_VERIFY" ]]; then
+            die 12 "TLS verification failed for alias ${_alias_domain}"
+        fi
+        log "TLS verification passed for alias ${_alias_domain}: ${_ALIAS_VERIFY}"
+    done
 else
     log "Skipping TLS verification (SSL_SKIP_VERIFY=true)"
 fi
 
 # ---------------------------------------------------------------------------
-# Step 6: Re-register with HAProxy including HTTPS port
+# Step 6: Re-register ALL domains with HAProxy including HTTPS port
 # ---------------------------------------------------------------------------
 if [[ -n "$HAPROXY_DETECTED" ]]; then
     build_auth_header
+    _haproxy_reregister_url="http://${HAPROXY_IP:-${HAPROXY_DETECTED}}:${HAPROXY_API_PORT}/v1/backends"
 
+    # Primary domain → app's HTTPS port
     PAYLOAD=$(jq -n \
         --arg domain "$SSL_DOMAIN" \
         --arg container "$(hostname)" \
@@ -389,15 +561,56 @@ if [[ -n "$HAPROXY_DETECTED" ]]; then
         '{domain: $domain, container: $container, http_port: $http_port, https_port: $https_port, extra_ports: $extra_ports}')
 
     http_code=$(curl -s -o /dev/null -w '%{http_code}' \
-        -X POST "http://${HAPROXY_IP:-${HAPROXY_DETECTED}}:${HAPROXY_API_PORT}/v1/backends" \
+        -X POST "$_haproxy_reregister_url" \
         -H "Content-Type: application/json" \
         "${AUTH_HEADER_ARGS[@]}" \
         -d "$PAYLOAD" --max-time 10 2>/dev/null) || http_code="000"
 
     if [[ "$http_code" != "200" && "$http_code" != "201" ]]; then
-        die 13 "HAProxy HTTPS registration failed (status=${http_code})"
+        die 13 "HAProxy HTTPS registration failed for ${SSL_DOMAIN} (status=${http_code})"
     fi
-    log "Re-registered with HAProxy (HTTPS port=${SSL_HTTPS_PORT}, status=${http_code})"
+    log "Registered ${SSL_DOMAIN} with HAProxy (HTTPS port=${SSL_HTTPS_PORT})"
+
+    # Alias domains → ssl-alias-proxy port (TLS terminated by ssl-manager)
+    for _reg_domain in "${ALL_SSL_DOMAINS[@]:1}"; do
+        PAYLOAD=$(jq -n \
+            --arg domain "$_reg_domain" \
+            --arg container "$(hostname)" \
+            --argjson http_port 80 \
+            --argjson https_port "${SSL_ALIAS_PROXY_PORT}" \
+            --argjson extra_ports "${EXTRA_PORTS:-null}" \
+            '{domain: $domain, container: $container, http_port: $http_port, https_port: $https_port, extra_ports: $extra_ports}')
+
+        http_code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -X POST "$_haproxy_reregister_url" \
+            -H "Content-Type: application/json" \
+            "${AUTH_HEADER_ARGS[@]}" \
+            -d "$PAYLOAD" --max-time 10 2>/dev/null) || http_code="000"
+
+        if [[ "$http_code" != "200" && "$http_code" != "201" ]]; then
+            die 13 "HAProxy HTTPS registration failed for alias ${_reg_domain} (status=${http_code})"
+        fi
+        log "Registered alias ${_reg_domain} with HAProxy (HTTPS→alias proxy port=${SSL_ALIAS_PROXY_PORT})"
+    done
+fi
+
+# ---------------------------------------------------------------------------
+# Step 6b: Start TLS alias proxy (if aliases configured)
+# ---------------------------------------------------------------------------
+if [[ ${#ALL_SSL_DOMAINS[@]} -gt 1 ]]; then
+    log "Starting TLS alias proxy on port ${SSL_ALIAS_PROXY_PORT}"
+    python3 /usr/local/bin/ssl-alias-proxy &
+    ALIAS_PROXY_PID=$!
+    echo "$ALIAS_PROXY_PID" > /tmp/.ssl-alias-proxy.pid
+
+    # Wait for alias proxy to bind
+    for _ in $(seq 1 10); do
+        if nc -z localhost "$SSL_ALIAS_PROXY_PORT" 2>/dev/null; then
+            log "TLS alias proxy ready (PID ${ALIAS_PROXY_PID})"
+            break
+        fi
+        sleep 0.5
+    done
 fi
 
 # ---------------------------------------------------------------------------
@@ -416,15 +629,32 @@ export SSL_CERT_FILE="$CERT_FILE"
 export SSL_KEY_FILE="$KEY_FILE"
 
 # Write paths to a sourceable file so the entrypoint can pick them up
+# Primary cert paths (backwards compatible)
 cat > /tmp/.ssl-env <<EOF
 SSL_CERT_FILE=${CERT_FILE}
 SSL_KEY_FILE=${KEY_FILE}
 EOF
+
+# Append alias cert paths for multi-domain consumers
+if [[ ${#ALL_SSL_DOMAINS[@]} -gt 1 ]]; then
+    {
+        echo "SSL_ALL_DOMAINS=\"${ALL_SSL_DOMAINS[*]}\""
+        for _d in "${ALL_SSL_DOMAINS[@]:1}"; do
+            _var_safe=${_d//[.-]/_}
+            echo "SSL_CERT_${_var_safe}=/etc/letsencrypt/live/${_d}/fullchain.pem"
+            echo "SSL_KEY_${_var_safe}=/etc/letsencrypt/live/${_d}/privkey.pem"
+        done
+    } >> /tmp/.ssl-env
+fi
 
 EXPIRY_INFO=$(openssl x509 -enddate -noout -in "$CERT_FILE" | cut -d= -f2)
 log "SSL setup complete for ${SSL_DOMAIN}"
 log "  Certificate: ${CERT_FILE}"
 log "  Private key: ${KEY_FILE}"
 log "  Expires:     ${EXPIRY_INFO}"
+for _d in "${ALL_SSL_DOMAINS[@]:1}"; do
+    _ALIAS_EXPIRY=$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/${_d}/fullchain.pem" | cut -d= -f2)
+    log "  Alias ${_d}: ${_ALIAS_EXPIRY}"
+done
 
 exit 0
