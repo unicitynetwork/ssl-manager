@@ -48,25 +48,29 @@ if [[ "${SSL_TEST_MODE}" == "true" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Log initial certificate expiry
+# Log certificate expiry for all domains
 # ---------------------------------------------------------------------------
-CERT_FILE="/etc/letsencrypt/live/${SSL_DOMAIN}/fullchain.pem"
-
 log_cert_expiry() {
-    if [[ -f "$CERT_FILE" ]]; then
-        local expiry_raw
-        expiry_raw=$(openssl x509 -enddate -noout -in "$CERT_FILE" | cut -d= -f2)
-        local expiry_epoch now_epoch days_left
-        expiry_epoch=$(date -d "$expiry_raw" +%s)
-        now_epoch=$(date +%s)
-        days_left=$(( (expiry_epoch - now_epoch) / 86400 ))
-        log "Certificate for ${SSL_DOMAIN} expires: ${expiry_raw} (${days_left} days remaining)"
-    else
-        warn "Certificate file not found: ${CERT_FILE}"
+    local _domains="${SSL_DOMAIN}"
+    if [[ -n "${SSL_DOMAIN_ALIASES:-}" ]]; then
+        _domains="${SSL_DOMAIN} ${SSL_DOMAIN_ALIASES//,/ }"
     fi
+    for _domain in $_domains; do
+        local _cert="/etc/letsencrypt/live/${_domain}/fullchain.pem"
+        if [[ -f "$_cert" ]]; then
+            local expiry_raw expiry_epoch now_epoch days_left
+            expiry_raw=$(openssl x509 -enddate -noout -in "$_cert" | cut -d= -f2)
+            expiry_epoch=$(date -d "$expiry_raw" +%s)
+            now_epoch=$(date +%s)
+            days_left=$(( (expiry_epoch - now_epoch) / 86400 ))
+            log "Certificate for ${_domain} expires: ${expiry_raw} (${days_left} days remaining)"
+        else
+            warn "Certificate file not found for ${_domain}: ${_cert}"
+        fi
+    done
 }
 
-log "Renewal loop started for ${SSL_DOMAIN}"
+log "Renewal loop started for ${SSL_DOMAIN}${SSL_DOMAIN_ALIASES:+ (aliases: ${SSL_DOMAIN_ALIASES})}"
 log_cert_expiry
 
 # ---------------------------------------------------------------------------
@@ -81,8 +85,8 @@ sleep 3600
 while true; do
     log "Checking certificate renewal..."
 
+    # Renew all managed certs (primary + aliases) without --cert-name
     if certbot renew \
-        --cert-name "${SSL_DOMAIN}" \
         --webroot \
         --webroot-path "$WEBROOT" \
         --deploy-hook "touch /tmp/.ssl-renewal-restart" \

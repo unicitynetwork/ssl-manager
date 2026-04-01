@@ -98,7 +98,6 @@ case "$ACTION" in
 
         if [[ "$http_code" == "200" || "$http_code" == "201" ]]; then
             log "Registered with HAProxy: domain=${SSL_DOMAIN}, https_port=${SSL_HTTPS_PORT} (status=${http_code})"
-            exit 0
         else
             err "Registration failed (status=${http_code})"
             if [[ -f /tmp/.haproxy-register-response ]]; then
@@ -106,27 +105,64 @@ case "$ACTION" in
             fi
             exit 1
         fi
+
+        # Register alias domains
+        if [[ -n "${SSL_DOMAIN_ALIASES:-}" ]]; then
+            IFS=',' read -ra _aliases <<< "$SSL_DOMAIN_ALIASES"
+            for _alias in "${_aliases[@]}"; do
+                _alias=$(echo "$_alias" | xargs)
+                [[ -z "$_alias" ]] && continue
+                ALIAS_PAYLOAD=$(jq -n \
+                    --arg domain "$_alias" \
+                    --arg container "$(hostname)" \
+                    --argjson http_port 80 \
+                    --argjson https_port "${SSL_HTTPS_PORT}" \
+                    --argjson extra_ports "${EXTRA_PORTS:-null}" \
+                    '{domain: $domain, container: $container, http_port: $http_port, https_port: $https_port, extra_ports: $extra_ports}')
+
+                _code=$(curl -sf -o /dev/null -w '%{http_code}' \
+                    -X POST "${BASE_URL}" -H "Content-Type: application/json" \
+                    "${AUTH_HEADER_ARGS[@]}" -d "$ALIAS_PAYLOAD" 2>/dev/null) || _code="000"
+
+                if [[ "$_code" == "200" || "$_code" == "201" ]]; then
+                    log "Registered alias: ${_alias} (status=${_code})"
+                else
+                    warn "Failed to register alias: ${_alias} (status=${_code})"
+                fi
+            done
+        fi
+        exit 0
         ;;
 
     unregister)
-        # URL-encode the domain for safety (though most domains are safe as-is)
+        # Unregister primary domain
         http_code=$(curl -sf -o /tmp/.haproxy-register-response -w '%{http_code}' \
             -X DELETE "${BASE_URL}/${SSL_DOMAIN}" \
             "${AUTH_HEADER_ARGS[@]}" 2>/dev/null) || http_code="000"
 
         if [[ "$http_code" == "204" || "$http_code" == "200" ]]; then
             log "Unregistered from HAProxy: domain=${SSL_DOMAIN} (status=${http_code})"
-            exit 0
         elif [[ "$http_code" == "404" ]]; then
             warn "Domain ${SSL_DOMAIN} was not registered with HAProxy (404 — already gone)"
-            exit 0
         else
             warn "Unexpected response during unregistration (status=${http_code})"
             if [[ -f /tmp/.haproxy-register-response ]]; then
                 warn "Response: $(cat /tmp/.haproxy-register-response)"
             fi
-            exit 1
         fi
+
+        # Unregister alias domains
+        if [[ -n "${SSL_DOMAIN_ALIASES:-}" ]]; then
+            IFS=',' read -ra _aliases <<< "$SSL_DOMAIN_ALIASES"
+            for _alias in "${_aliases[@]}"; do
+                _alias=$(echo "$_alias" | xargs)
+                [[ -z "$_alias" ]] && continue
+                curl -sf -o /dev/null -X DELETE "${BASE_URL}/${_alias}" \
+                    "${AUTH_HEADER_ARGS[@]}" 2>/dev/null || true
+                log "Unregistered alias: ${_alias}"
+            done
+        fi
+        exit 0
         ;;
 
     *)
