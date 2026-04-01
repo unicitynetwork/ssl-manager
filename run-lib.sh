@@ -318,14 +318,20 @@ HELP
 # ═══════════════════════════════════════════════════════════════════════════════
 ssl_manager_run() {
     # Parse arguments
+    local consumed=0
     while [[ $# -gt 0 ]]; do
-        _ssl_parse_arg "$@"; local consumed=$?
+        # Capture return code without triggering set -e.
+        # Functions return N>0 to indicate "consumed N args", 0 for "not mine".
+        # set -e treats non-zero return as error, so we use "if" to suppress it.
+        if _ssl_parse_arg "$@"; then consumed=0; else consumed=$?; fi
         if [ "$consumed" -gt 0 ]; then shift "$consumed"; continue; fi
         if type app_parse_args &>/dev/null; then
-            app_parse_args "$@"; consumed=$?
+            if app_parse_args "$@"; then consumed=0; else consumed=$?; fi
             if [ "$consumed" -gt 0 ]; then shift "$consumed"; continue; fi
         fi
-        echo "Unknown option: $1" >&2; echo "Run with --help for usage." >&2; exit 1
+        echo "Unknown option: $1" >&2
+        echo "Run with --help for usage." >&2
+        exit 1
     done
     [ "$SHOW_HELP" = true ] && { echo "Usage: $(basename "$0") [options]"; echo ""; _ssl_print_help; exit 0; }
 
