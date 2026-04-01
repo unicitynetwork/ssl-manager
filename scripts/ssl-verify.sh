@@ -96,13 +96,41 @@ case "$MODE" in
 
         if [[ "$NONCE_MATCHED" == "true" ]]; then
             log "HTTP verification passed — domain ${SSL_DOMAIN} is reachable"
-            exit 0
         else
             err "HTTP verification failed — domain ${SSL_DOMAIN} is not routable to this container"
             err "  Expected nonce: ${NONCE}"
             err "  Got: ${RESPONSE:-<no response>}"
             exit 1
         fi
+
+        # Verify alias domains
+        if [[ -n "${SSL_DOMAIN_ALIASES:-}" ]]; then
+            IFS=',' read -ra _aliases <<< "$SSL_DOMAIN_ALIASES"
+            for _alias in "${_aliases[@]}"; do
+                _alias=$(echo "$_alias" | xargs)
+                [[ -z "$_alias" ]] && continue
+
+                _ANONCE=$(openssl rand -hex 16)
+                log "HTTP nonce verification for alias ${_alias}"
+                curl -sf -X POST "http://localhost:80/_ssl/nonce/${_ANONCE}" >/dev/null 2>&1
+
+                _AMATCHED=false
+                for _att in 1 2 3; do
+                    _ARESP=$(curl -sf --max-time 10 "http://${_alias}/_ssl/nonce/${_ANONCE}" 2>/dev/null) || _ARESP=""
+                    if [[ "$_ARESP" == "$_ANONCE" ]]; then _AMATCHED=true; break; fi
+                    if [[ "$_att" -lt 3 ]]; then sleep 5; fi
+                done
+                curl -sf -X DELETE "http://localhost:80/_ssl/nonce/${_ANONCE}" >/dev/null 2>&1 || true
+
+                if [[ "$_AMATCHED" == "true" ]]; then
+                    log "HTTP verification passed — alias ${_alias} is reachable"
+                else
+                    err "HTTP verification failed — alias ${_alias} is not routable"
+                    exit 1
+                fi
+            done
+        fi
+        exit 0
         ;;
 
     https)
@@ -128,12 +156,39 @@ case "$MODE" in
             if [[ -n "$EXPIRY" ]]; then
                 log "Certificate expiry: ${EXPIRY}"
             fi
-
-            exit 0
         else
             err "TLS verification failed — could not complete handshake to ${SSL_DOMAIN}:${SSL_HTTPS_PORT}"
             exit 1
         fi
+
+        # Verify alias domains
+        if [[ -n "${SSL_DOMAIN_ALIASES:-}" ]]; then
+            IFS=',' read -ra _aliases <<< "$SSL_DOMAIN_ALIASES"
+            for _alias in "${_aliases[@]}"; do
+                _alias=$(echo "$_alias" | xargs)
+                [[ -z "$_alias" ]] && continue
+
+                log "TLS verification for alias ${_alias}:${SSL_HTTPS_PORT}"
+                _ATLS=$(printf '' | openssl s_client \
+                    -connect "${_alias}:${SSL_HTTPS_PORT}" \
+                    -servername "${_alias}" \
+                    2>/dev/null) || _ATLS=""
+
+                _ASUBJ=$(printf '%s' "$_ATLS" \
+                    | openssl x509 -noout -subject 2>/dev/null) || _ASUBJ=""
+
+                if [[ -n "$_ASUBJ" ]]; then
+                    _AEXP=$(printf '%s' "$_ATLS" \
+                        | openssl x509 -noout -enddate 2>/dev/null) || _AEXP=""
+                    log "TLS verification passed for alias ${_alias}: ${_ASUBJ}"
+                    if [[ -n "$_AEXP" ]]; then log "  ${_AEXP}"; fi
+                else
+                    err "TLS verification failed for alias ${_alias}"
+                    exit 1
+                fi
+            done
+        fi
+        exit 0
         ;;
 
     *)

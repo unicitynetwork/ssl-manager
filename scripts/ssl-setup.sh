@@ -505,6 +505,34 @@ if [[ "${SSL_SKIP_VERIFY}" != "true" ]]; then
         die 12 "TLS verification failed — certificate may be invalid"
     fi
     log "TLS verification passed: ${VERIFY_RESULT}"
+
+    # Verify alias certificates
+    for _alias_domain in "${ALL_SSL_DOMAINS[@]:1}"; do
+        _ALIAS_CERT="/etc/letsencrypt/live/${_alias_domain}/fullchain.pem"
+        _ALIAS_KEY="/etc/letsencrypt/live/${_alias_domain}/privkey.pem"
+
+        log "Verifying TLS certificate for alias: ${_alias_domain}"
+        kill "$TLS_TEST_PID" 2>/dev/null || true
+        wait "$TLS_TEST_PID" 2>/dev/null || true
+
+        openssl s_server -cert "$_ALIAS_CERT" -key "$_ALIAS_KEY" \
+            -accept 8443 -www -quiet &
+        TLS_TEST_PID=$!
+        sleep 1
+
+        _ALIAS_VERIFY=$(printf '' | openssl s_client -connect localhost:8443 \
+            -servername "${_alias_domain}" 2>/dev/null \
+            | openssl x509 -noout -subject 2>/dev/null) || _ALIAS_VERIFY=""
+
+        kill "$TLS_TEST_PID" 2>/dev/null || true
+        wait "$TLS_TEST_PID" 2>/dev/null || true
+        TLS_TEST_PID=""
+
+        if [[ -z "$_ALIAS_VERIFY" ]]; then
+            die 12 "TLS verification failed for alias ${_alias_domain}"
+        fi
+        log "TLS verification passed for alias ${_alias_domain}: ${_ALIAS_VERIFY}"
+    done
 else
     log "Skipping TLS verification (SSL_SKIP_VERIFY=true)"
 fi
