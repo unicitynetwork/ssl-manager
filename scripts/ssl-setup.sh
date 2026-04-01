@@ -327,6 +327,12 @@ if [[ "$NONCE_MATCHED" != "true" ]]; then
 fi
 log "Domain reachability confirmed"
 
+# Allow HAProxy time to reload after alias registrations
+if [[ ${#ALL_SSL_DOMAINS[@]} -gt 1 ]]; then
+    log "Waiting 5s for HAProxy to reload with alias routes..."
+    sleep 5
+fi
+
 # Verify alias domains
 for _alias_domain in "${ALL_SSL_DOMAINS[@]:1}"; do
     _ALIAS_NONCE=$(openssl rand -hex 16)
