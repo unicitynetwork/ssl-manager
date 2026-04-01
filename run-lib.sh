@@ -207,19 +207,35 @@ _ssl_start_container() {
 
     local all_env=() all_ports=() all_extra=() host_opts=()
 
-    while IFS= read -r a; do [ -n "$a" ] && all_env+=("$a"); done < <(_ssl_env_args)
-    while IFS= read -r a; do [ -n "$a" ] && all_ports+=("$a"); done < <(_ssl_port_args)
+    # Helper: read lines of "-flag value" or "-flag=value" and split into
+    # separate array elements so docker receives them as distinct arguments.
+    # e.g., "-e SSL_DOMAIN=foo" → array gets two elements: "-e" "SSL_DOMAIN=foo"
+    _read_docker_args() {
+        local -n _arr=$1; shift
+        while IFS= read -r _line; do
+            [ -z "$_line" ] && continue
+            # Split "-flag value" into two elements
+            if [[ "$_line" == -* && "$_line" == *" "* ]]; then
+                _arr+=("${_line%% *}" "${_line#* }")
+            else
+                _arr+=("$_line")
+            fi
+        done < <("$@")
+    }
+
+    _read_docker_args all_env _ssl_env_args
+    _read_docker_args all_ports _ssl_port_args
 
     if type app_env_args &>/dev/null; then
-        while IFS= read -r a; do [ -n "$a" ] && all_env+=("$a"); done < <(app_env_args)
+        _read_docker_args all_env app_env_args
     fi
     if type app_port_args &>/dev/null; then
         if ! { [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; }; then
-            while IFS= read -r a; do [ -n "$a" ] && all_ports+=("$a"); done < <(app_port_args)
+            _read_docker_args all_ports app_port_args
         fi
     fi
     if type app_docker_args &>/dev/null; then
-        while IFS= read -r a; do [ -n "$a" ] && all_extra+=("$a"); done < <(app_docker_args)
+        _read_docker_args all_extra app_docker_args
     fi
     if type app_needs_host_gateway &>/dev/null && app_needs_host_gateway; then
         [[ "${OSTYPE:-linux}" != "darwin"* ]] && host_opts=(--add-host=host.docker.internal:host-gateway)
