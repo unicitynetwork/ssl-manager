@@ -161,19 +161,19 @@ _ssl_env_args() {
         echo "-e SSL_REQUIRED=$SSL_REQUIRED"
         echo "-e SSL_HTTPS_PORT=$SSL_HTTPS_PORT"
         echo "-e APP_HTTP_PORT=$APP_HTTP_PORT"
-        [ -n "$SSL_ADMIN_EMAIL" ] && echo "-e SSL_ADMIN_EMAIL=$SSL_ADMIN_EMAIL"
+        if [ -n "$SSL_ADMIN_EMAIL" ]; then echo "-e SSL_ADMIN_EMAIL=$SSL_ADMIN_EMAIL"; fi
         if [ -n "$SSL_DOMAIN_ALIASES" ]; then
             echo "-e SSL_DOMAIN_ALIASES=$SSL_DOMAIN_ALIASES"
             echo "-e SSL_ALIAS_PROXY_PORT=${SSL_ALIAS_PROXY_PORT:-8444}"
         fi
-        [ -n "$SSL_STAGING" ]     && echo "-e SSL_STAGING=$SSL_STAGING"
-        [ -n "$SSL_TEST_MODE" ]   && echo "-e SSL_TEST_MODE=$SSL_TEST_MODE"
+        if [ -n "$SSL_STAGING" ]; then echo "-e SSL_STAGING=$SSL_STAGING"; fi
+        if [ -n "$SSL_TEST_MODE" ]; then echo "-e SSL_TEST_MODE=$SSL_TEST_MODE"; fi
     fi
     if [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; then
         echo "-e HAPROXY_HOST=$HAPROXY_HOST"
         echo "-e HAPROXY_API_PORT=$HAPROXY_API_PORT"
-        [ -n "$HAPROXY_API_KEY" ] && echo "-e HAPROXY_API_KEY=$HAPROXY_API_KEY"
-        [ -n "$EXTRA_PORTS" ]     && echo "-e EXTRA_PORTS=$EXTRA_PORTS"
+        if [ -n "$HAPROXY_API_KEY" ]; then echo "-e HAPROXY_API_KEY=$HAPROXY_API_KEY"; fi
+        if [ -n "$EXTRA_PORTS" ]; then echo "-e EXTRA_PORTS=$EXTRA_PORTS"; fi
     fi
 }
 
@@ -182,12 +182,12 @@ _ssl_port_args() {
     if [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; then
         return  # HAProxy owns all ports
     fi
-    [ -n "$SSL_DOMAIN" ] && echo "-p 80:80"
+    if [ -n "$SSL_DOMAIN" ]; then echo "-p 80:80"; fi
 }
 
 # ─── Setup Docker networks ───────────────────────────────────────────────────
 _ssl_setup_networks() {
-    [ -n "${APP_NET:-}" ] && { docker network inspect "$APP_NET" >/dev/null 2>&1 || docker network create "$APP_NET"; }
+    if [ -n "${APP_NET:-}" ]; then docker network inspect "$APP_NET" >/dev/null 2>&1 || docker network create "$APP_NET"; fi
     if [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; then
         docker network inspect "$HAPROXY_NET" >/dev/null 2>&1 || docker network create "$HAPROXY_NET"
     fi

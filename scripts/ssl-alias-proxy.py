@@ -33,6 +33,7 @@ PRIMARY_DOMAIN = os.environ.get("SSL_DOMAIN", "")
 ALIASES_RAW = os.environ.get("SSL_DOMAIN_ALIASES", "")
 CERT_BASE = "/etc/letsencrypt/live"
 BUFFER_SIZE = 65536
+MAX_CONNECTIONS = 200
 SHUTDOWN = False
 
 
@@ -88,7 +89,10 @@ def build_ssl_context(aliases):
     def sni_callback(sslsock, server_name, _ctx):
         if server_name in alias_contexts:
             sslsock.context = alias_contexts[server_name]
-        # else: use default context (first alias cert)
+        else:
+            # Reject unknown domains instead of serving wrong cert
+            warn(f"Rejecting unknown SNI: {server_name}")
+            return ssl.ALERT_DESCRIPTION_UNRECOGNIZED_NAME
 
     ctx.sni_callback = sni_callback
     return ctx
@@ -97,8 +101,14 @@ def build_ssl_context(aliases):
 def forward_data(src, dst, label):
     """Forward data from src socket to dst socket."""
     try:
+        src.settimeout(300)  # 5 min timeout to detect dead peers
         while not SHUTDOWN:
-            data = src.recv(BUFFER_SIZE)
+            try:
+                data = src.recv(BUFFER_SIZE)
+            except socket.timeout:
+                if SHUTDOWN:
+                    break
+                continue  # keepalive — retry recv
             if not data:
                 break
             dst.sendall(data)
@@ -111,9 +121,10 @@ def forward_data(src, dst, label):
             pass
 
 
-def handle_client(client_ssl, client_addr):
+def handle_client(client_ssl, client_addr, semaphore=None):
     """Handle one alias TLS connection: terminate and forward to app."""
     upstream_ssl = None
+    upstream_sock = None
     try:
         # Connect to the app's primary HTTPS port with TLS
         upstream_sock = socket.create_connection(
@@ -122,7 +133,12 @@ def handle_client(client_ssl, client_addr):
         upstream_ctx = ssl.create_default_context()
         upstream_ctx.check_hostname = False
         upstream_ctx.verify_mode = ssl.CERT_NONE  # local loopback, app's self-managed cert
-        upstream_ssl = upstream_ctx.wrap_socket(upstream_sock)
+        try:
+            upstream_ssl = upstream_ctx.wrap_socket(upstream_sock)
+        except Exception:
+            upstream_sock.close()
+            upstream_sock = None
+            raise
 
         # Bidirectional forwarding
         t1 = threading.Thread(
@@ -153,6 +169,8 @@ def handle_client(client_ssl, client_addr):
                 upstream_ssl.close()
             except OSError:
                 pass
+        if semaphore:
+            semaphore.release()
 
 
 def reload_certs(server_ctx, aliases):
@@ -204,7 +222,8 @@ def main():
     server_sock.bind(("0.0.0.0", LISTEN_PORT))
     server_sock.listen(128)
 
-    log(f"Listening on 0.0.0.0:{LISTEN_PORT}")
+    log(f"Listening on 0.0.0.0:{LISTEN_PORT} (max {MAX_CONNECTIONS} connections)")
+    conn_semaphore = threading.Semaphore(MAX_CONNECTIONS)
 
     # Write PID for lifecycle management
     with open("/tmp/.ssl-alias-proxy.pid", "w") as f:
@@ -218,36 +237,50 @@ def main():
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    # Cert reload check (every 60s, watches /tmp/.ssl-renewal-restart)
+    # Cert reload check (every 60s, watches /tmp/.ssl-renewal-restart mtime)
     last_reload_check = time.time()
+    last_reload_mtime = 0
 
     while not SHUTDOWN:
         try:
             client_sock, client_addr = server_sock.accept()
         except socket.timeout:
-            # Check for cert reload
+            # Check for cert reload (only if marker file mtime changed)
             now = time.time()
             if now - last_reload_check > 60:
                 last_reload_check = now
-                if os.path.exists("/tmp/.ssl-renewal-restart"):
-                    reload_certs(ctx, aliases)
+                try:
+                    mtime = os.path.getmtime("/tmp/.ssl-renewal-restart")
+                    if mtime > last_reload_mtime:
+                        last_reload_mtime = mtime
+                        reload_certs(ctx, aliases)
+                except FileNotFoundError:
+                    pass
             continue
         except OSError:
             if SHUTDOWN:
                 break
             raise
 
-        try:
-            client_ssl = ctx.wrap_socket(client_sock, server_side=True)
-        except ssl.SSLError as e:
-            client_sock.close()
-            continue
-        except OSError:
+        if not conn_semaphore.acquire(timeout=1):
+            warn("Max connections reached, rejecting")
             client_sock.close()
             continue
 
+        try:
+            client_ssl = ctx.wrap_socket(client_sock, server_side=True)
+        except ssl.SSLError:
+            client_sock.close()
+            conn_semaphore.release()
+            continue
+        except OSError:
+            client_sock.close()
+            conn_semaphore.release()
+            continue
+
         t = threading.Thread(
-            target=handle_client, args=(client_ssl, client_addr), daemon=True
+            target=handle_client, args=(client_ssl, client_addr, conn_semaphore),
+            daemon=True,
         )
         t.start()
 
