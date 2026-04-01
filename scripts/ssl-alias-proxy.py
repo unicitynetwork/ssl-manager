@@ -193,6 +193,9 @@ def reload_certs(server_ctx, aliases):
     def sni_callback(sslsock, server_name, _ctx):
         if server_name in alias_contexts:
             sslsock.context = alias_contexts[server_name]
+        else:
+            warn(f"Rejecting unknown SNI after reload: {server_name}")
+            return ssl.ALERT_DESCRIPTION_UNRECOGNIZED_NAME
 
     server_ctx.sni_callback = sni_callback
 
