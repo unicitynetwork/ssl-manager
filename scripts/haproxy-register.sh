@@ -29,6 +29,7 @@ readonly LOG_PREFIX="[${SCRIPT_NAME}]"
 # Defaults
 # ---------------------------------------------------------------------------
 : "${SSL_HTTPS_PORT:=443}"
+: "${SSL_ALIAS_PROXY_PORT:=8444}"
 : "${HAPROXY_API_PORT:=8404}"
 
 # ---------------------------------------------------------------------------
@@ -112,11 +113,12 @@ case "$ACTION" in
             for _alias in "${_aliases[@]}"; do
                 _alias=$(echo "$_alias" | xargs)
                 [[ -z "$_alias" ]] && continue
+                # Aliases use the alias proxy port (TLS terminated by ssl-manager)
                 ALIAS_PAYLOAD=$(jq -n \
                     --arg domain "$_alias" \
                     --arg container "$(hostname)" \
                     --argjson http_port 80 \
-                    --argjson https_port "${SSL_HTTPS_PORT}" \
+                    --argjson https_port "${SSL_ALIAS_PROXY_PORT}" \
                     --argjson extra_ports "${EXTRA_PORTS:-null}" \
                     '{domain: $domain, container: $container, http_port: $http_port, https_port: $https_port, extra_ports: $extra_ports}')
 
@@ -125,7 +127,7 @@ case "$ACTION" in
                     "${AUTH_HEADER_ARGS[@]}" -d "$ALIAS_PAYLOAD" 2>/dev/null) || _code="000"
 
                 if [[ "$_code" == "200" || "$_code" == "201" ]]; then
-                    log "Registered alias: ${_alias} (status=${_code})"
+                    log "Registered alias: ${_alias} (port=${SSL_ALIAS_PROXY_PORT}, status=${_code})"
                 else
                     warn "Failed to register alias: ${_alias} (status=${_code})"
                 fi

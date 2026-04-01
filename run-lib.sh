@@ -162,7 +162,10 @@ _ssl_env_args() {
         echo "-e SSL_HTTPS_PORT=$SSL_HTTPS_PORT"
         echo "-e APP_HTTP_PORT=$APP_HTTP_PORT"
         [ -n "$SSL_ADMIN_EMAIL" ] && echo "-e SSL_ADMIN_EMAIL=$SSL_ADMIN_EMAIL"
-        [ -n "$SSL_DOMAIN_ALIASES" ] && echo "-e SSL_DOMAIN_ALIASES=$SSL_DOMAIN_ALIASES"
+        if [ -n "$SSL_DOMAIN_ALIASES" ]; then
+            echo "-e SSL_DOMAIN_ALIASES=$SSL_DOMAIN_ALIASES"
+            echo "-e SSL_ALIAS_PROXY_PORT=${SSL_ALIAS_PROXY_PORT:-8444}"
+        fi
         [ -n "$SSL_STAGING" ]     && echo "-e SSL_STAGING=$SSL_STAGING"
         [ -n "$SSL_TEST_MODE" ]   && echo "-e SSL_TEST_MODE=$SSL_TEST_MODE"
     fi

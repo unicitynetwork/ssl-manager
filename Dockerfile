@@ -18,18 +18,22 @@ COPY scripts/ssl-renew.sh       /usr/local/bin/ssl-renew
 COPY scripts/haproxy-register.sh /usr/local/bin/haproxy-register
 COPY scripts/ssl-verify.sh      /usr/local/bin/ssl-verify
 COPY scripts/ssl-http-proxy.py  /usr/local/bin/ssl-http-proxy
+COPY scripts/ssl-alias-proxy.py /usr/local/bin/ssl-alias-proxy
 
 RUN chmod +x /usr/local/bin/ssl-setup \
              /usr/local/bin/ssl-renew \
              /usr/local/bin/haproxy-register \
              /usr/local/bin/ssl-verify \
-             /usr/local/bin/ssl-http-proxy
+             /usr/local/bin/ssl-http-proxy \
+             /usr/local/bin/ssl-alias-proxy
 
 # ACME challenge webroot directory
 RUN mkdir -p /var/www/acme-challenge/.well-known/acme-challenge
 
 # HTTP reverse proxy port (ACME challenges + app forwarding)
 EXPOSE 80
+# TLS alias proxy port (alias domain termination + forwarding to app)
+EXPOSE 8444
 
 # Let's Encrypt certificate storage -- mount a volume here
 VOLUME ["/etc/letsencrypt"]
