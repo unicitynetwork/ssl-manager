@@ -40,7 +40,6 @@ readonly LOG_PREFIX="[${SCRIPT_NAME}]"
 : "${APP_HTTP_PORT:=0}"
 : "${HAPROXY_API_PORT:=8404}"
 : "${SSL_SKIP_VERIFY:=false}"
-: "${SSL_ALIAS_PROXY_PORT:=8444}"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -571,13 +570,13 @@ if [[ -n "$HAPROXY_DETECTED" ]]; then
     fi
     log "Registered ${SSL_DOMAIN} with HAProxy (HTTPS port=${SSL_HTTPS_PORT})"
 
-    # Alias domains → ssl-alias-proxy port (TLS terminated by ssl-manager)
+    # Alias domains → same HTTPS port as primary (app handles SNI via nginx)
     for _reg_domain in "${ALL_SSL_DOMAINS[@]:1}"; do
         PAYLOAD=$(jq -n \
             --arg domain "$_reg_domain" \
             --arg container "$(hostname)" \
             --argjson http_port 80 \
-            --argjson https_port "${SSL_ALIAS_PROXY_PORT}" \
+            --argjson https_port "${SSL_HTTPS_PORT}" \
             --argjson extra_ports "${EXTRA_PORTS:-null}" \
             '{domain: $domain, container: $container, http_port: $http_port, https_port: $https_port, extra_ports: $extra_ports}')
 
@@ -590,26 +589,7 @@ if [[ -n "$HAPROXY_DETECTED" ]]; then
         if [[ "$http_code" != "200" && "$http_code" != "201" ]]; then
             die 13 "HAProxy HTTPS registration failed for alias ${_reg_domain} (status=${http_code})"
         fi
-        log "Registered alias ${_reg_domain} with HAProxy (HTTPS→alias proxy port=${SSL_ALIAS_PROXY_PORT})"
-    done
-fi
-
-# ---------------------------------------------------------------------------
-# Step 6b: Start TLS alias proxy (if aliases configured)
-# ---------------------------------------------------------------------------
-if [[ ${#ALL_SSL_DOMAINS[@]} -gt 1 ]]; then
-    log "Starting TLS alias proxy on port ${SSL_ALIAS_PROXY_PORT}"
-    /usr/local/bin/ssl-alias-proxy-wrapper &
-    ALIAS_PROXY_PID=$!
-    echo "$ALIAS_PROXY_PID" > /tmp/.ssl-alias-proxy.pid
-
-    # Wait for alias proxy to bind
-    for _ in $(seq 1 10); do
-        if nc -z localhost "$SSL_ALIAS_PROXY_PORT" 2>/dev/null; then
-            log "TLS alias proxy ready (PID ${ALIAS_PROXY_PID})"
-            break
-        fi
-        sleep 0.5
+        log "Registered alias ${_reg_domain} with HAProxy (HTTPS port=${SSL_HTTPS_PORT})"
     done
 fi
 
