@@ -291,5 +291,40 @@ def main():
     log("Alias proxy stopped")
 
 
+
+def run_supervised():
+    """Run main() in a restart loop with exponential backoff."""
+    backoff = 1
+    max_backoff = 60
+    restart_count = 0
+
+    while True:
+        try:
+            restart_count += 1
+            if restart_count > 1:
+                log(f"Restarting alias proxy (attempt {restart_count}, backoff {backoff}s)")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
+            main()
+            # main() returns normally only on graceful shutdown (SIGTERM/SIGINT)
+            break
+        except SystemExit as e:
+            if e.code == 0:
+                break  # clean exit
+            if e.code == 1 and restart_count == 1:
+                # First attempt failed (no valid certs) — don't retry
+                log("Alias proxy cannot start — exiting")
+                raise
+            warn(f"Alias proxy exited with code {e.code}")
+        except Exception as e:
+            warn(f"Alias proxy crashed: {e}")
+
+        # Reset SHUTDOWN flag for restart
+        global SHUTDOWN
+        SHUTDOWN = False
+
+    log("Alias proxy supervisor exiting")
+
+
 if __name__ == "__main__":
-    main()
+    run_supervised()
