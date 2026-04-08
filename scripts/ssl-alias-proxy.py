@@ -271,6 +271,7 @@ def main():
             continue
 
         try:
+            client_sock.settimeout(10)  # TLS handshake timeout (catches bare TCP health checks)
             client_ssl = ctx.wrap_socket(client_sock, server_side=True)
         except ssl.SSLError:
             client_sock.close()
