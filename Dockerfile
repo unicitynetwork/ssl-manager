@@ -19,13 +19,15 @@ COPY scripts/haproxy-register.sh /usr/local/bin/haproxy-register
 COPY scripts/ssl-verify.sh      /usr/local/bin/ssl-verify
 COPY scripts/ssl-http-proxy.py  /usr/local/bin/ssl-http-proxy
 COPY scripts/ssl-alias-proxy.py /usr/local/bin/ssl-alias-proxy
+COPY scripts/ssl-alias-proxy-wrapper.sh /usr/local/bin/ssl-alias-proxy-wrapper
 
 RUN chmod +x /usr/local/bin/ssl-setup \
              /usr/local/bin/ssl-renew \
              /usr/local/bin/haproxy-register \
              /usr/local/bin/ssl-verify \
              /usr/local/bin/ssl-http-proxy \
-             /usr/local/bin/ssl-alias-proxy
+             /usr/local/bin/ssl-alias-proxy \
+             /usr/local/bin/ssl-alias-proxy-wrapper
 
 # ACME challenge webroot directory
 RUN mkdir -p /var/www/acme-challenge/.well-known/acme-challenge

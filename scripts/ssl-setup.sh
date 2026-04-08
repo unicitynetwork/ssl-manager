@@ -599,7 +599,7 @@ fi
 # ---------------------------------------------------------------------------
 if [[ ${#ALL_SSL_DOMAINS[@]} -gt 1 ]]; then
     log "Starting TLS alias proxy on port ${SSL_ALIAS_PROXY_PORT}"
-    python3 /usr/local/bin/ssl-alias-proxy &
+    /usr/local/bin/ssl-alias-proxy-wrapper &
     ALIAS_PROXY_PID=$!
     echo "$ALIAS_PROXY_PID" > /tmp/.ssl-alias-proxy.pid
 
