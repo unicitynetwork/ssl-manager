@@ -72,6 +72,16 @@ export function loadAcl(aclFile) {
   }
 }
 
+const DOMAIN_RE = /^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/;
+
+/**
+ * Validate a domain name per RFC 1123.
+ */
+function validateDomain(domain) {
+  if (typeof domain !== 'string') return false;
+  return DOMAIN_RE.test(domain);
+}
+
 /**
  * Check if a client npub is authorized for the given domains.
  */
@@ -83,6 +93,10 @@ export function checkAcl(acl, clientNpub, primaryDomain, aliases = []) {
 
   const allDomains = [primaryDomain, ...aliases];
   for (const domain of allDomains) {
+    // Validate domain format before ACL check
+    if (!validateDomain(domain)) {
+      return { authorized: false, error: 'ERR_DOMAIN_INVALID', domain };
+    }
     if (!domainMatchesPatterns(domain, entry.domains)) {
       return { authorized: false, error: 'ERR_DOMAIN_UNAUTHORIZED', domain };
     }
@@ -99,8 +113,9 @@ function domainMatchesPatterns(domain, patterns) {
   for (const pattern of patterns) {
     if (pattern === domain) return true;
     if (pattern.startsWith('*.')) {
-      const suffix = pattern.substring(2);
-      if (domain.endsWith(suffix) && domain.length > suffix.length) {
+      // Keep the dot: ".example.com" so "evil-example.com" doesn't match
+      const suffix = pattern.substring(1); // e.g., ".example.com"
+      if (domain.endsWith(suffix) && domain.length > suffix.length - 1) {
         return true;
       }
     }

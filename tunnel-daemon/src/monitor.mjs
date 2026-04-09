@@ -29,8 +29,9 @@ export function startMonitorServer(port, sessionManager, ipPool, wgManagerModule
     }
   });
 
-  server.listen(port, '0.0.0.0', () => {
-    log(`Monitor server listening on port ${port}`);
+  const bindAddr = process.env.TUNNEL_MONITOR_BIND || '127.0.0.1';
+  server.listen(port, bindAddr, () => {
+    log(`Monitor server listening on ${bindAddr}:${port}`);
   });
 
   return server;

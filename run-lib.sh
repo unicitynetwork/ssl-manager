@@ -408,6 +408,10 @@ ssl_manager_run() {
     [ "$SHOW_HELP" = true ] && { echo "Usage: $(basename "$0") [options]"; echo ""; _ssl_print_help; exit 0; }
 
     # Validate
+    if [ "$USE_TUNNEL" = true ] && [ -n "${HAPROXY_HOST:-}" ] && [ "$HAPROXY_HOST" != "haproxy" ]; then
+        echo "ERROR: --remote-haproxy-id and --haproxy-host are mutually exclusive" >&2
+        exit 1
+    fi
     validate_port "SSL_HTTPS_PORT" "$SSL_HTTPS_PORT"
     validate_port "APP_HTTP_PORT" "$APP_HTTP_PORT"
     [ "$APP_HTTP_PORT" = "80" ] && { echo "ERROR: APP_HTTP_PORT cannot be 80" >&2; exit 1; }

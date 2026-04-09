@@ -7,7 +7,7 @@
  * cannot be granted.
  */
 
-import { spawn, execSync } from 'node:child_process';
+import { spawn, execSync, execFileSync } from 'node:child_process';
 import { writeFileSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -18,16 +18,35 @@ function warn(msg) { console.error(`${LOG_PREFIX} WARNING: ${msg}`); }
 function err(msg) { console.error(`${LOG_PREFIX} ERROR: ${msg}`); }
 
 /**
+ * Input validation functions.
+ */
+function validateHostname(host) {
+  if (typeof host !== 'string' || host.length === 0 || host.length > 253) {
+    throw new Error('Invalid hostname');
+  }
+  // Allow IP addresses and valid hostnames
+  if (!/^[a-zA-Z0-9._-]+$/.test(host)) {
+    throw new Error('Hostname contains invalid characters');
+  }
+}
+
+function validatePort(port) {
+  const p = parseInt(port, 10);
+  if (isNaN(p) || p < 1 || p > 65535) throw new Error('Invalid port number');
+  return p;
+}
+
+/**
  * Check if autossh is available.
  */
 export function checkSshAvailability() {
   try {
-    execSync('which autossh', { stdio: 'pipe' });
+    execFileSync('which', ['autossh'], { stdio: 'pipe', timeout: 30000 });
     return { available: true, method: 'autossh' };
   } catch {}
 
   try {
-    execSync('which ssh', { stdio: 'pipe' });
+    execFileSync('which', ['ssh'], { stdio: 'pipe', timeout: 30000 });
     return { available: true, method: 'ssh' };
   } catch {}
 
@@ -39,19 +58,31 @@ export function checkSshAvailability() {
  * Returns true if the fingerprint matches.
  */
 export function verifyHostKey(host, port, expectedFingerprint) {
+  validateHostname(host);
+  const validPort = validatePort(port);
+
   try {
-    const output = execSync(
-      `ssh-keyscan -p ${port} -T 10 ${host} 2>/dev/null | ssh-keygen -lf - 2>/dev/null`,
-      { encoding: 'utf-8', shell: '/bin/bash' }
+    // Use execFileSync for ssh-keyscan to avoid shell injection,
+    // then pipe output to ssh-keygen via stdin
+    const keyscanOutput = execFileSync(
+      'ssh-keyscan', ['-p', String(validPort), '-T', '10', host],
+      { encoding: 'utf-8', timeout: 30000, stdio: ['pipe', 'pipe', 'pipe'] }
     );
 
-    for (const line of output.split('\n')) {
+    const fingerprintOutput = execSync('ssh-keygen -lf -', {
+      input: keyscanOutput,
+      encoding: 'utf-8',
+      timeout: 30000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    for (const line of fingerprintOutput.split('\n')) {
       if (line.includes(expectedFingerprint)) {
         return true;
       }
     }
 
-    warn(`Host key fingerprint mismatch for ${host}:${port}`);
+    warn(`Host key fingerprint mismatch for ${host}:${validPort}`);
     return false;
   } catch (e) {
     err(`Failed to verify host key: ${e.message}`);
@@ -69,9 +100,14 @@ export function verifyHostKey(host, port, expectedFingerprint) {
 export function establishSshTunnel(auth, opts = {}) {
   const { ssh_host, ssh_port, ssh_user, ssh_host_key_fingerprint, forwarded_ports } = auth;
 
+  // Validate inputs from tunnel offer (attacker-controlled)
+  validateHostname(ssh_host);
+  const validPort = validatePort(ssh_port);
+  validateHostname(ssh_user); // SSH usernames have similar character constraints
+
   // Verify host key
   if (ssh_host_key_fingerprint) {
-    if (!verifyHostKey(ssh_host, ssh_port, ssh_host_key_fingerprint)) {
+    if (!verifyHostKey(ssh_host, validPort, ssh_host_key_fingerprint)) {
       throw new Error('SSH host key fingerprint verification failed');
     }
     log('SSH host key fingerprint verified');
@@ -80,8 +116,9 @@ export function establishSshTunnel(auth, opts = {}) {
   // Build port forwarding arguments
   const portArgs = [];
   for (const fp of forwarded_ports) {
-    portArgs.push('-R', `${fp.remote_bind}:localhost:${fp.local_port}`);
-    log(`Port forward: ${fp.remote_bind} -> localhost:${fp.local_port} (${fp.description})`);
+    const localPort = validatePort(fp.local_port);
+    portArgs.push('-R', `${fp.remote_bind}:localhost:${localPort}`);
+    log(`Port forward: ${fp.remote_bind} -> localhost:${localPort} (${fp.description})`);
   }
 
   // SSH options for stability
@@ -106,12 +143,12 @@ export function establishSshTunnel(auth, opts = {}) {
 
   args.push(
     ...sshOpts,
-    '-p', String(ssh_port),
+    '-p', String(validPort),
     ...portArgs,
     `${ssh_user}@${ssh_host}`,
   );
 
-  log(`Starting ${cmd} tunnel to ${ssh_user}@${ssh_host}:${ssh_port}`);
+  log(`Starting ${cmd} tunnel to ${ssh_user}@${ssh_host}:${validPort}`);
   const proc = spawn(cmd, args, {
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: false,
@@ -159,13 +196,14 @@ export function killSshTunnel(proc) {
 export function verifySshTunnel(forwardedPorts) {
   let allOk = true;
   for (const fp of forwardedPorts) {
+    const localPort = validatePort(fp.local_port);
     try {
-      execSync(`nc -z localhost ${fp.local_port} 2>/dev/null`, {
+      execFileSync('nc', ['-z', 'localhost', String(localPort)], {
         stdio: 'pipe',
         timeout: 5000,
       });
     } catch {
-      warn(`Port ${fp.local_port} (${fp.description}) not reachable`);
+      warn(`Port ${localPort} (${fp.description}) not reachable`);
       allOk = false;
     }
   }

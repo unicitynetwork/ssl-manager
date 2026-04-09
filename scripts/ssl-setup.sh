@@ -57,6 +57,7 @@ die() {
 # PIDs of background processes we may need to clean up on error
 HTTP_PROXY_PID=""
 TLS_TEST_PID=""
+TUNNEL_MANAGER_PID=""
 
 cleanup_on_error() {
     if [[ -n "$HTTP_PROXY_PID" ]]; then
@@ -64,6 +65,9 @@ cleanup_on_error() {
     fi
     if [[ -n "$TLS_TEST_PID" ]]; then
         kill "$TLS_TEST_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$TUNNEL_MANAGER_PID" ]]; then
+        kill "$TUNNEL_MANAGER_PID" 2>/dev/null || true
     fi
 }
 trap cleanup_on_error ERR
@@ -90,6 +94,7 @@ log "Starting SSL setup for domain: ${SSL_DOMAIN}"
 # ---------------------------------------------------------------------------
 # Step 0b: Remote tunnel mode detection
 # ---------------------------------------------------------------------------
+TUNNEL_MANAGER_PID=""
 if [[ -n "${REMOTE_HAPROXY_ID:-}" ]]; then
     log "Remote tunnel mode detected (REMOTE_HAPROXY_ID set)"
     log "  Remote HAProxy: ${REMOTE_HAPROXY_ID:0:16}..."
@@ -100,30 +105,51 @@ if [[ -n "${REMOTE_HAPROXY_ID:-}" ]]; then
     fi
 
     _tunnel_timeout="${TUNNEL_NEGOTIATE_TIMEOUT:-300}"
-    log "Starting tunnel-manager (timeout: ${_tunnel_timeout}s)..."
+    log "Starting tunnel-manager in background (timeout: ${_tunnel_timeout}s)..."
 
-    _tunnel_exit=0
+    # Run tunnel-manager in the background to avoid hanging on Node.js timers
     if command -v tunnel-manager &>/dev/null; then
-        tunnel-manager --start --wait-ready --timeout "$_tunnel_timeout" || _tunnel_exit=$?
+        tunnel-manager --start &
     else
-        node /usr/local/bin/tunnel-manager/src/index.mjs --start --wait-ready --timeout "$_tunnel_timeout" || _tunnel_exit=$?
+        node /usr/local/bin/tunnel-manager/src/index.mjs --start &
+    fi
+    TUNNEL_MANAGER_PID=$!
+
+    # Poll for the env file with a timeout loop
+    _tunnel_waited=0
+    while [[ ! -f /tmp/.ssl-tunnel-env ]] && [[ "$_tunnel_waited" -lt "$_tunnel_timeout" ]]; do
+        sleep 2
+        _tunnel_waited=$((_tunnel_waited + 2))
+        # Check if tunnel-manager died
+        if ! kill -0 "$TUNNEL_MANAGER_PID" 2>/dev/null; then
+            wait "$TUNNEL_MANAGER_PID" 2>/dev/null
+            _tunnel_exit=$?
+            die "$_tunnel_exit" "tunnel-manager exited with code ${_tunnel_exit}"
+        fi
+    done
+
+    if [[ ! -f /tmp/.ssl-tunnel-env ]]; then
+        log "ERROR: tunnel-manager timed out after ${_tunnel_timeout}s"
+        kill "$TUNNEL_MANAGER_PID" 2>/dev/null || true
+        die 15 "Tunnel negotiation timed out after ${_tunnel_timeout}s"
     fi
 
-    if [[ "$_tunnel_exit" -ne 0 ]]; then
-        die "$_tunnel_exit" "Tunnel establishment failed (exit code: ${_tunnel_exit})"
+    log "Sourcing tunnel environment from /tmp/.ssl-tunnel-env"
+    # shellcheck disable=SC1091
+    . /tmp/.ssl-tunnel-env
+
+    # Validate sourced values to prevent shell injection
+    if [[ -n "${HAPROXY_HOST:-}" ]] && ! [[ "$HAPROXY_HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        log "ERROR: Invalid HAPROXY_HOST from tunnel: $HAPROXY_HOST"
+        kill "$TUNNEL_MANAGER_PID" 2>/dev/null || true
+        die 15 "Invalid HAPROXY_HOST from tunnel environment"
     fi
 
-    if [[ -f /tmp/.ssl-tunnel-env ]]; then
-        log "Sourcing tunnel environment from /tmp/.ssl-tunnel-env"
-        # shellcheck disable=SC1091
-        . /tmp/.ssl-tunnel-env
-        log "  HAPROXY_HOST=${HAPROXY_HOST:-<not set>}"
-        log "  HAPROXY_API_PORT=${HAPROXY_API_PORT:-<not set>}"
-        log "  TUNNEL_TYPE=${TUNNEL_TYPE:-<not set>}"
-        log "  TUNNEL_CLIENT_IP=${TUNNEL_CLIENT_IP:-<not set>}"
-    else
-        die 16 "Tunnel environment file /tmp/.ssl-tunnel-env not found after tunnel-manager"
-    fi
+    log "  HAPROXY_HOST=${HAPROXY_HOST:-<not set>}"
+    log "  HAPROXY_API_PORT=${HAPROXY_API_PORT:-<not set>}"
+    log "  TUNNEL_TYPE=${TUNNEL_TYPE:-<not set>}"
+    log "  TUNNEL_CLIENT_IP=${TUNNEL_CLIENT_IP:-<not set>}"
+    log "  Tunnel manager PID: ${TUNNEL_MANAGER_PID}"
 fi
 
 # Parse domain aliases into an array

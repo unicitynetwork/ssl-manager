@@ -6,20 +6,7 @@
 # Usage:
 #   FROM ghcr.io/unicitynetwork/ssl-manager:tunnel
 
-FROM debian:trixie-slim
-
-# Install base ssl-manager dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        certbot \
-        curl \
-        jq \
-        openssl \
-        netcat-openbsd \
-        python3 \
-        ca-certificates \
-        procps \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+FROM ghcr.io/unicitynetwork/ssl-manager:latest
 
 # Install tunnel-specific dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -34,31 +21,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Install wireguard-go (userspace fallback for kernels < 5.6)
-# Note: wireguard-go is fetched as a static binary if available,
-# otherwise built from source. For now, the kernel module is preferred.
-RUN which wireguard-go 2>/dev/null || true
-
-# SSL management scripts (same as base image)
-COPY scripts/ssl-setup.sh       /usr/local/bin/ssl-setup
-COPY scripts/ssl-renew.sh       /usr/local/bin/ssl-renew
-COPY scripts/haproxy-register.sh /usr/local/bin/haproxy-register
-COPY scripts/ssl-verify.sh      /usr/local/bin/ssl-verify
-COPY scripts/ssl-http-proxy.py  /usr/local/bin/ssl-http-proxy
-COPY scripts/ssl-alias-proxy.py /usr/local/bin/ssl-alias-proxy
-COPY scripts/ssl-alias-proxy-wrapper.sh /usr/local/bin/ssl-alias-proxy-wrapper
-
-RUN chmod +x /usr/local/bin/ssl-setup \
-             /usr/local/bin/ssl-renew \
-             /usr/local/bin/haproxy-register \
-             /usr/local/bin/ssl-verify \
-             /usr/local/bin/ssl-http-proxy \
-             /usr/local/bin/ssl-alias-proxy \
-             /usr/local/bin/ssl-alias-proxy-wrapper
+# Validate Node.js version (require 18.x, 20.x, or 22.x)
+RUN node --version | grep -qE '^v(18|20|22)\.' || { echo "Unsupported Node.js version: $(node --version)"; exit 1; }
 
 # Tunnel manager (Node.js client-side component)
 COPY tunnel-manager/ /usr/local/bin/tunnel-manager/
-RUN cd /usr/local/bin/tunnel-manager && npm install --production 2>/dev/null || true
+RUN cd /usr/local/bin/tunnel-manager && npm install --production \
+    && test -d node_modules  # fail if npm install produced nothing
 
 # Create wrapper script for tunnel-manager
 RUN printf '#!/bin/bash\nexec node /usr/local/bin/tunnel-manager/src/index.mjs "$@"\n' \

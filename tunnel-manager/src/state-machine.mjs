@@ -66,6 +66,7 @@ export class TunnelStateMachine {
     this._heartbeatTimer = null;
     this._healthCheckTimer = null;
     this._shutdownRequested = false;
+    this._reconnecting = false;
   }
 
   /**
@@ -491,7 +492,9 @@ export class TunnelStateMachine {
   _startHeartbeat() {
     this._heartbeatTimer = setInterval(() => {
       if (!this._shutdownRequested) {
-        this._sendHeartbeat();
+        this._sendHeartbeat().catch(e => {
+          warn(`Heartbeat send error: ${e.message}`);
+        });
       }
     }, this.config.tunnelHeartbeatInterval);
   }
@@ -522,6 +525,16 @@ export class TunnelStateMachine {
    * Reconnection logic.
    */
   async _reconnect() {
+    // Prevent concurrent reconnect attempts
+    if (this._reconnecting) return EXIT_CODES.SUCCESS;
+    this._reconnecting = true;
+
+    // Clear health and heartbeat timers to prevent concurrent checks during reconnect
+    clearInterval(this._healthCheckTimer);
+    clearInterval(this._heartbeatTimer);
+    this._healthCheckTimer = null;
+    this._heartbeatTimer = null;
+
     this._setState(CLIENT_STATE.RECONNECTING);
     this.reconnectCount++;
 
@@ -546,6 +559,9 @@ export class TunnelStateMachine {
         if (isHandshakeFresh()) {
           log('WireGuard reconnected via interface restart');
           this._setState(CLIENT_STATE.ACTIVE);
+          this._startHealthCheck();
+          this._startHeartbeat();
+          this._reconnecting = false;
           await this._sendHeartbeat();
           return EXIT_CODES.SUCCESS;
         }
@@ -571,6 +587,9 @@ export class TunnelStateMachine {
 
       this._setState(CLIENT_STATE.ACTIVE);
       this._writeTunnelEnv();
+      this._startHealthCheck();
+      this._startHeartbeat();
+      this._reconnecting = false;
       log('Tunnel re-established');
       return EXIT_CODES.SUCCESS;
     }
@@ -585,6 +604,9 @@ export class TunnelStateMachine {
           this.sshProcess = establishSshTunnel(auth);
           await sleep(3000);
           this._setState(CLIENT_STATE.ACTIVE);
+          this._startHealthCheck();
+          this._startHeartbeat();
+          this._reconnecting = false;
           return EXIT_CODES.SUCCESS;
         } catch (e) {
           err(`SSH reconnect failed: ${e.message}`);
@@ -592,6 +614,7 @@ export class TunnelStateMachine {
       }
     }
 
+    this._reconnecting = false;
     return EXIT_CODES.TUNNEL_FAILED;
   }
 

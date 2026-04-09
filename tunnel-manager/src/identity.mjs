@@ -1,10 +1,10 @@
 /**
- * Identity management — Sphere SDK / Nostr keypair and WireGuard keypair.
+ * Identity management -- Sphere SDK / Nostr keypair and WireGuard keypair.
  *
  * Loads or generates persistent identity files stored in TUNNEL_IDENTITY_DIR.
  */
 
-import { execSync } from 'node:child_process';
+import { execSync, execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import * as crypto from 'node:crypto';
@@ -73,10 +73,11 @@ export function loadOrCreateWireguardKeys(identityDir) {
   }
 
   try {
-    const privateKey = execSync('wg genkey', { encoding: 'utf-8' }).trim();
-    const publicKey = execSync(`echo "${privateKey}" | wg pubkey`, {
+    const privateKey = execFileSync('wg', ['genkey'], { encoding: 'utf-8', timeout: 30000 }).trim();
+    const publicKey = execSync('wg pubkey', {
+      input: privateKey + '\n',
       encoding: 'utf-8',
-      shell: '/bin/bash',
+      timeout: 30000,
     }).trim();
 
     writeFileSync(privateKeyFile, privateKey + '\n', { mode: 0o600 });

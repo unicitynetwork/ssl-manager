@@ -34,14 +34,14 @@ export class SessionManager {
    * Get or create a session for a client + domain pair.
    * If an existing session is active, tears it down first.
    */
-  getOrCreate(clientNpub, primaryDomain, correlationId) {
+  getOrCreate(clientNpub, primaryDomain, correlationId, onCleanup) {
     const key = `${clientNpub}:${primaryDomain}`;
     const existing = this.sessions.get(key);
 
     if (existing && existing.state !== SERVER_STATE.IDLE) {
-      // At-most-one: tear down existing session
+      // At-most-one: tear down existing session with resource cleanup
       log(`Tearing down existing session for ${key}`);
-      this._teardownSession(existing);
+      this._teardownSession(existing, onCleanup);
     }
 
     const session = {
@@ -83,6 +83,14 @@ export class SessionManager {
       }
     }
     return null;
+  }
+
+  /**
+   * Find a session by client npub and primary domain.
+   */
+  findByClientAndDomain(clientNpub, primaryDomain) {
+    const key = `${clientNpub}:${primaryDomain}`;
+    return this.sessions.get(key) || null;
   }
 
   /**
@@ -234,13 +242,16 @@ export class SessionManager {
     }
 
     // Add to tombstone cache (5 minutes)
-    this.tombstones.set(session.correlationId, {
-      expiry: Date.now() + 5 * 60 * 1000,
-      key: session.key,
-    });
+    if (session.correlationId) {
+      this.tombstones.set(session.correlationId, {
+        expiry: Date.now() + 5 * 60 * 1000,
+        key: session.key,
+      });
+    }
 
-    // Set state to IDLE
+    // Set state to IDLE and null out correlationId to prevent stale correlation matches
     session.state = SERVER_STATE.IDLE;
+    session.correlationId = null;
     log(`Session ${session.key}: TORN DOWN`);
   }
 

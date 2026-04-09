@@ -28,9 +28,10 @@ export class NostrClient {
     this.relays = [];
     this.connected = false;
     this.messageHandlers = [];
-    this.seenEventIds = new Set();
+    this.seenEventIds = new Map(); // eventId -> timestamp for per-entry expiry
     this.eventIdExpiry = 120_000; // 2 minutes
     this._cleanupInterval = null;
+    this._nostrTools = null;
   }
 
   /**
@@ -44,6 +45,9 @@ export class NostrClient {
     try {
       nostrTools = await import('nostr-tools');
     } catch (err) {
+      if (process.env.SSL_TEST_MODE !== 'true') {
+        throw new Error('nostr-tools not available — cannot operate in production without Nostr messaging');
+      }
       warn(`nostr-tools not available: ${err.message}`);
       warn('Falling back to simulated relay mode (for development/testing)');
       this.connected = true;
@@ -68,11 +72,17 @@ export class NostrClient {
 
     this.relays = connected;
     this.connected = true;
+    this._nostrTools = nostrTools;
     log(`Connected to ${connected.length}/${this.relayUrls.length} relay(s)`);
 
-    // Start event ID cleanup
+    // Start event ID cleanup — expire individual entries rather than clearing all
     this._cleanupInterval = setInterval(() => {
-      this.seenEventIds.clear();
+      const now = Date.now();
+      for (const [id, ts] of this.seenEventIds.entries()) {
+        if (now - ts > this.eventIdExpiry) {
+          this.seenEventIds.delete(id);
+        }
+      }
     }, this.eventIdExpiry);
   }
 
@@ -92,21 +102,34 @@ export class NostrClient {
       return { eventId: randomUUID(), relayCount: 0 };
     }
 
-    // In production, this uses NIP-17 gift-wrap via Sphere SDK.
-    // For now, we use NIP-04 direct messages as a fallback (less secure).
+    // TODO: Upgrade to NIP-17 gift-wrap when Sphere SDK integration is ready
+    // For now, we use NIP-04 encrypted direct messages as a minimum security baseline.
     let publishedCount = 0;
     let eventId = null;
 
+    // Resolve recipient hex pubkey for NIP-04 encryption
+    const recipientPubkeyHex = recipientNpub;
+    const senderPrivkeyHex = this.identity.privkeyHex;
+
+    // Encrypt content using NIP-04
+    let encrypted;
+    try {
+      const { nip04, finalizeEvent, getPublicKey } = this._nostrTools;
+      encrypted = await nip04.encrypt(senderPrivkeyHex, recipientPubkeyHex, msgJson);
+    } catch (encErr) {
+      throw new Error(`NIP-04 encryption failed: ${encErr.message}`);
+    }
+
     for (const { url, relay } of this.relays) {
       try {
-        // Create and publish the event
-        // Note: Full NIP-17 gift wrapping would be done here via Sphere SDK
-        const event = {
-          kind: 4, // NIP-04 DM (should be NIP-17 in production)
-          content: msgJson,
-          tags: [['p', recipientNpub]],
+        // Create and sign the NIP-04 encrypted event
+        const { finalizeEvent } = this._nostrTools;
+        const event = finalizeEvent({
+          kind: 4,
+          content: encrypted,
+          tags: [['p', recipientPubkeyHex]],
           created_at: Math.floor(Date.now() / 1000),
-        };
+        }, senderPrivkeyHex);
         await relay.publish(event);
         eventId = event.id;
         publishedCount++;
@@ -142,16 +165,25 @@ export class NostrClient {
             authors: [senderNpub],
           }
         ], {
-          onevent: (event) => {
+          onevent: async (event) => {
+            // Verify event signature before processing
+            const { verifyEvent, nip04 } = this._nostrTools;
+            if (!verifyEvent(event)) {
+              warn('Rejecting event with invalid signature');
+              return;
+            }
+
             // Deduplicate by event ID
             if (this.seenEventIds.has(event.id)) return;
-            this.seenEventIds.add(event.id);
+            this.seenEventIds.set(event.id, Date.now());
 
             try {
-              const msg = JSON.parse(event.content);
+              // Decrypt NIP-04 content
+              const decrypted = await nip04.decrypt(this.identity.privkeyHex, event.pubkey, event.content);
+              const msg = JSON.parse(decrypted);
               handler(msg);
             } catch (err) {
-              warn(`Failed to parse DM content: ${err.message}`);
+              warn(`Failed to decrypt/parse DM content: ${err.message}`);
             }
           }
         });
@@ -170,9 +202,16 @@ export class NostrClient {
   waitForMessage(senderNpub, msgType, correlationId, timeoutMs) {
     return new Promise((resolve) => {
       let settled = false;
+
+      const removeHandler = () => {
+        const idx = this.messageHandlers.findIndex(h => h.handler === handler);
+        if (idx !== -1) this.messageHandlers.splice(idx, 1);
+      };
+
       const timer = setTimeout(() => {
         if (!settled) {
           settled = true;
+          removeHandler();
           resolve(null);
         }
       }, timeoutMs);
@@ -184,6 +223,7 @@ export class NostrClient {
         if (typeMatch && corrMatch) {
           settled = true;
           clearTimeout(timer);
+          removeHandler();
           resolve(msg);
         }
       };
@@ -192,6 +232,7 @@ export class NostrClient {
         if (!settled) {
           settled = true;
           clearTimeout(timer);
+          removeHandler();
           resolve(null);
         }
       });

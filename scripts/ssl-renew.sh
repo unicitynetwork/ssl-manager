@@ -90,17 +90,21 @@ while true; do
         # shellcheck disable=SC1091
         . /tmp/.ssl-tunnel-env
         if [[ "${TUNNEL_ACTIVE:-}" == "true" ]] && [[ "${TUNNEL_TYPE:-}" == "wireguard" ]]; then
-            _wg_handshake=$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)
-            _now=$(date +%s)
-            if [[ -n "$_wg_handshake" ]] && [[ "$_wg_handshake" -gt 0 ]]; then
-                _handshake_age=$(( _now - _wg_handshake ))
-                if [[ "$_handshake_age" -gt 180 ]]; then
-                    warn "Tunnel handshake stale (${_handshake_age}s ago) — skipping renewal attempt"
-                    log "Next renewal check in ~12 hours"
-                    JITTER=$((RANDOM % 1800))
-                    sleep $((43200 + JITTER))
-                    continue
+            if command -v wg >/dev/null 2>&1; then
+                _wg_handshake=$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)
+                _now=$(date +%s)
+                if [[ -n "$_wg_handshake" ]] && [[ "$_wg_handshake" -gt 0 ]]; then
+                    _handshake_age=$(( _now - _wg_handshake ))
+                    if [[ "$_handshake_age" -gt 180 ]]; then
+                        warn "Tunnel handshake stale (${_handshake_age}s ago) — skipping renewal attempt"
+                        log "Next renewal check in ~12 hours"
+                        JITTER=$((RANDOM % 1800))
+                        sleep $((43200 + JITTER))
+                        continue
+                    fi
                 fi
+            else
+                warn "wg command not found, cannot verify tunnel health"
             fi
         fi
     fi

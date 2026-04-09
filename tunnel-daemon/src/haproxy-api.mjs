@@ -2,17 +2,71 @@
  * HAProxy runtime API integration.
  *
  * Manages HAProxy backends via the runtime API for tunnel peers.
- * Uses the HAProxy Runtime API (Unix socket or HTTP) to add/remove
- * backends pointing to WireGuard peer IPs.
+ * Uses Node.js native http module instead of shell curl to prevent
+ * command injection vulnerabilities.
  */
 
-import { execSync } from 'node:child_process';
+import * as http from 'node:http';
+import { execFileSync } from 'node:child_process';
 
 const LOG_PREFIX = '[tunnel-daemon:haproxy]';
 
 function log(msg) { console.log(`${LOG_PREFIX} ${msg}`); }
 function warn(msg) { console.error(`${LOG_PREFIX} WARNING: ${msg}`); }
 function err(msg) { console.error(`${LOG_PREFIX} ERROR: ${msg}`); }
+
+/**
+ * Synchronous HTTP request using a Node child process.
+ * Avoids shell interpolation entirely -- no command injection possible.
+ * Returns { statusCode, body }.
+ */
+function httpRequestSync(method, urlStr, options = {}) {
+  const { body = null, headers = {}, timeout = 10000 } = options;
+
+  // Build a self-contained Node script that makes the HTTP request
+  const scriptPayload = JSON.stringify({ method, urlStr, headers, body, timeout });
+  const script = `
+    const http = require('node:http');
+    const input = ${scriptPayload};
+    const parsed = new URL(input.urlStr);
+    const options = {
+      hostname: parsed.hostname,
+      port: parsed.port || 80,
+      path: parsed.pathname + parsed.search,
+      method: input.method,
+      headers: input.headers,
+      timeout: input.timeout,
+    };
+    const req = http.request(options, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => {
+        process.stdout.write(JSON.stringify({
+          statusCode: res.statusCode,
+          body: Buffer.concat(chunks).toString('utf-8'),
+        }));
+      });
+    });
+    req.on('error', (e) => {
+      process.stderr.write(e.message);
+      process.exit(1);
+    });
+    req.on('timeout', () => {
+      req.destroy(new Error('Request timed out'));
+    });
+    if (input.body !== null) {
+      req.write(input.body);
+    }
+    req.end();
+  `;
+
+  const result = execFileSync('node', ['-e', script], {
+    encoding: 'utf-8',
+    timeout: timeout + 5000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  return JSON.parse(result);
+}
 
 /**
  * Register a backend with HAProxy for a tunnel peer.
@@ -48,21 +102,24 @@ export function registerBackend(opts) {
     tunnel_peer_ip: peerIp, // Mark as tunnel backend
   });
 
-  const authHeader = sessionKey ? `-H "Authorization: Bearer ${sessionKey}"` : '';
+  const headers = { 'Content-Type': 'application/json' };
+  if (sessionKey) {
+    headers['Authorization'] = `Bearer ${sessionKey}`;
+  }
 
   try {
-    const result = execSync(
-      `curl -sf -o /dev/null -w '%{http_code}' -X POST "http://${apiHost}:${apiPort}/v1/backends" ` +
-      `-H "Content-Type: application/json" ${authHeader} -d '${payload}' --max-time 10`,
-      { encoding: 'utf-8', shell: '/bin/bash', stdio: ['pipe', 'pipe', 'pipe'] }
-    ).trim();
+    const result = httpRequestSync('POST', `http://${apiHost}:${apiPort}/v1/backends`, {
+      body: payload,
+      headers,
+      timeout: 10000,
+    });
 
-    if (result === '200' || result === '201') {
+    if (result.statusCode === 200 || result.statusCode === 201) {
       log(`Registered backend: ${domain} -> ${peerIp}:${httpPort}/${httpsPort || 'null'}`);
       return true;
     }
 
-    warn(`Backend registration returned status ${result} for ${domain}`);
+    warn(`Backend registration returned status ${result.statusCode} for ${domain}`);
     return false;
   } catch (e) {
     err(`Failed to register backend ${domain}: ${e.message}`);
@@ -74,16 +131,24 @@ export function registerBackend(opts) {
  * Deregister a backend from HAProxy.
  */
 export function deregisterBackend(domain, apiHost = 'localhost', apiPort = 8404, sessionKey = '') {
-  const authHeader = sessionKey ? `-H "Authorization: Bearer ${sessionKey}"` : '';
+  const headers = {};
+  if (sessionKey) {
+    headers['Authorization'] = `Bearer ${sessionKey}`;
+  }
 
   try {
-    execSync(
-      `curl -sf -o /dev/null -X DELETE "http://${apiHost}:${apiPort}/v1/backends/${domain}" ` +
-      `${authHeader} --max-time 10`,
-      { shell: '/bin/bash', stdio: 'pipe' }
-    );
-    log(`Deregistered backend: ${domain}`);
-    return true;
+    const result = httpRequestSync('DELETE', `http://${apiHost}:${apiPort}/v1/backends/${encodeURIComponent(domain)}`, {
+      headers,
+      timeout: 10000,
+    });
+
+    if (result.statusCode === 204 || result.statusCode === 200 || result.statusCode === 404) {
+      log(`Deregistered backend: ${domain}`);
+      return true;
+    }
+
+    warn(`Deregister returned status ${result.statusCode} for ${domain}`);
+    return false;
   } catch (e) {
     warn(`Failed to deregister backend ${domain}: ${e.message}`);
     return false;
@@ -144,11 +209,10 @@ export function deregisterSessionBackends(session, apiHost, apiPort) {
  */
 export function checkHealth(apiHost = 'localhost', apiPort = 8404) {
   try {
-    const result = execSync(
-      `curl -sf --max-time 5 "http://${apiHost}:${apiPort}/v1/health"`,
-      { encoding: 'utf-8', shell: '/bin/bash', stdio: ['pipe', 'pipe', 'pipe'] }
-    ).trim();
-    return JSON.parse(result);
+    const result = httpRequestSync('GET', `http://${apiHost}:${apiPort}/v1/health`, {
+      timeout: 5000,
+    });
+    return JSON.parse(result.body);
   } catch {
     return null;
   }

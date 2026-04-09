@@ -5,8 +5,8 @@
  * health monitoring, and reconnection.
  */
 
-import { execSync, exec } from 'node:child_process';
-import { writeFileSync, existsSync, unlinkSync } from 'node:fs';
+import { execSync, execFileSync, exec } from 'node:child_process';
+import { writeFileSync, existsSync, unlinkSync, mkdirSync } from 'node:fs';
 import { hostname } from 'node:os';
 
 const LOG_PREFIX = '[tunnel-manager:wireguard]';
@@ -18,22 +18,40 @@ function err(msg) { console.error(`${LOG_PREFIX} ERROR: ${msg}`); }
 const WG_CONF_PATH = '/etc/wireguard/wg0.conf';
 
 /**
+ * Input validation functions.
+ */
+function validateIpv4(ip) {
+  if (typeof ip !== 'string' || !/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip)) {
+    throw new Error('Invalid IPv4 address format');
+  }
+  const parts = ip.split('.').map(Number);
+  if (parts.some(p => p < 0 || p > 255)) throw new Error('IPv4 octet out of range');
+}
+
+function validatePort(port) {
+  const p = parseInt(port, 10);
+  if (isNaN(p) || p < 1 || p > 65535) throw new Error('Invalid port number');
+  return p;
+}
+
+/**
  * Check if WireGuard is available (kernel module or wireguard-go).
  * Returns { available: boolean, method: string }.
  */
 export function checkWireGuardAvailability() {
-  // Try kernel module
+  // Try kernel module -- need shell for the || fallback
   try {
     execSync('modprobe wireguard 2>/dev/null || modinfo wireguard 2>/dev/null', {
       stdio: 'pipe',
       shell: '/bin/bash',
+      timeout: 30000,
     });
     return { available: true, method: 'kernel' };
   } catch {}
 
   // Try wireguard-go
   try {
-    execSync('which wireguard-go', { stdio: 'pipe' });
+    execFileSync('which', ['wireguard-go'], { stdio: 'pipe', timeout: 30000 });
     return { available: true, method: 'wireguard-go' };
   } catch {}
 
@@ -51,13 +69,15 @@ export function detectDockerSubnets() {
   ]);
 
   try {
-    const output = execSync("ip -o addr show | awk '{print $4}'", {
+    const output = execFileSync('ip', ['-o', 'addr', 'show'], {
       encoding: 'utf-8',
-      shell: '/bin/bash',
+      timeout: 30000,
     });
 
     for (const line of output.split('\n')) {
-      const cidr = line.trim();
+      // Extract CIDR from ip -o addr show output (field 4)
+      const fields = line.trim().split(/\s+/);
+      const cidr = fields[3] || '';
       if (!cidr || cidr.includes(':')) continue; // skip IPv6
 
       // If it's in a Docker range, add the subnet
@@ -130,9 +150,7 @@ PersistentKeepalive = 25
 `;
 
   // Ensure directory exists
-  try {
-    execSync('mkdir -p /etc/wireguard', { stdio: 'pipe' });
-  } catch {}
+  mkdirSync('/etc/wireguard', { recursive: true, mode: 0o700 });
 
   writeFileSync(WG_CONF_PATH, config, { mode: 0o600 });
   log(`WireGuard config written to ${WG_CONF_PATH}`);
@@ -145,7 +163,7 @@ PersistentKeepalive = 25
  */
 export function wgUp() {
   try {
-    execSync('wg-quick up wg0', { stdio: 'pipe', shell: '/bin/bash' });
+    execFileSync('wg-quick', ['up', 'wg0'], { stdio: 'pipe', timeout: 30000 });
     log('WireGuard interface wg0 is up');
     return true;
   } catch (e) {
@@ -159,7 +177,8 @@ export function wgUp() {
  */
 export function wgDown() {
   try {
-    execSync('wg-quick down wg0 2>/dev/null || true', { stdio: 'pipe', shell: '/bin/bash' });
+    // wg-quick down can fail if interface doesn't exist; that's ok
+    execSync('wg-quick down wg0 2>/dev/null || true', { stdio: 'pipe', shell: '/bin/bash', timeout: 30000 });
     log('WireGuard interface wg0 is down');
   } catch (e) {
     warn(`Error bringing down wg0: ${e.message}`);
@@ -172,9 +191,10 @@ export function wgDown() {
  */
 export function getLatestHandshake() {
   try {
-    const output = execSync('wg show wg0 latest-handshakes', {
+    const output = execFileSync('wg', ['show', 'wg0', 'latest-handshakes'], {
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 30000,
     });
 
     for (const line of output.split('\n')) {
@@ -207,9 +227,10 @@ export function isHandshakeFresh(staleThresholdMs = 180_000) {
  */
 export function getWgStats() {
   try {
-    const output = execSync('wg show wg0 transfer', {
+    const output = execFileSync('wg', ['show', 'wg0', 'transfer'], {
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 30000,
     });
 
     for (const line of output.split('\n')) {
@@ -232,12 +253,15 @@ export function getWgStats() {
  * Returns RTT in milliseconds or null on failure.
  */
 export function verifyConnectivity(serverIp, timeoutSeconds = 5) {
+  validateIpv4(serverIp);
   try {
-    const output = execSync(
-      `ping -c 1 -W ${timeoutSeconds} ${serverIp} 2>/dev/null | grep 'time=' | sed 's/.*time=\\([0-9.]*\\).*/\\1/'`,
-      { encoding: 'utf-8', shell: '/bin/bash' }
-    );
-    const rtt = parseFloat(output.trim());
+    const output = execFileSync('ping', ['-c', '1', '-W', String(timeoutSeconds), serverIp], {
+      encoding: 'utf-8',
+      timeout: (timeoutSeconds + 5) * 1000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const match = output.match(/time=([0-9.]+)/);
+    const rtt = match ? parseFloat(match[1]) : NaN;
     return isNaN(rtt) ? null : rtt;
   } catch {
     return null;
@@ -248,10 +272,12 @@ export function verifyConnectivity(serverIp, timeoutSeconds = 5) {
  * Verify HAProxy API reachability through the tunnel.
  */
 export function verifyHaproxyApi(serverIp, apiPort = 8404) {
+  validateIpv4(serverIp);
+  const port = validatePort(apiPort);
   try {
-    execSync(`curl -sf --max-time 5 http://${serverIp}:${apiPort}/v1/health >/dev/null 2>&1`, {
+    execFileSync('curl', ['-sf', '--max-time', '5', `http://${serverIp}:${port}/v1/health`], {
       stdio: 'pipe',
-      shell: '/bin/bash',
+      timeout: 10000,
     });
     return true;
   } catch {
@@ -264,7 +290,7 @@ export function verifyHaproxyApi(serverIp, apiPort = 8404) {
  */
 export function verifyDockerDns() {
   try {
-    execSync('getent hosts localhost >/dev/null 2>&1', { stdio: 'pipe' });
+    execFileSync('getent', ['hosts', 'localhost'], { stdio: 'pipe', timeout: 30000 });
     return true;
   } catch {
     return false;

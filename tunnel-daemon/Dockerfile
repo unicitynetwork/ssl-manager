@@ -35,7 +35,11 @@ COPY package.json /opt/tunnel-daemon/
 
 # Install Node.js dependencies
 WORKDIR /opt/tunnel-daemon
-RUN npm install --production 2>/dev/null || true
+# Validate Node.js version (require 18.x, 20.x, or 22.x)
+RUN node --version | grep -qE '^v(18|20|22)\.' || { echo "Unsupported Node.js version: $(node --version)"; exit 1; }
+
+RUN npm install --production \
+    && test -d node_modules  # fail if npm install produced nothing
 
 # Create required directories
 RUN mkdir -p /var/lib/haproxy-tunnel/peers \

@@ -198,7 +198,99 @@ export function validateEnvelope(msg) {
     return { valid: false, error: 'Missing or invalid payload' };
   }
 
+  // Per-message-type payload validation
+  try {
+    validatePayload(msg.msg_type, msg.payload);
+  } catch (e) {
+    return { valid: false, error: `Payload validation failed: ${e.message}` };
+  }
+
   return { valid: true };
+}
+
+const DOMAIN_RE = /^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/;
+const WG_PUBKEY_RE = /^[A-Za-z0-9+/]{42}[A-Za-z0-9+/=]=$/;
+
+/**
+ * Validate payload fields based on message type.
+ * Throws on invalid payload.
+ */
+function validatePayload(msgType, payload) {
+  switch (msgType) {
+    case MSG.TUNNEL_REQUEST:
+      validateTunnelRequestPayload(payload);
+      break;
+    case MSG.TUNNEL_OFFER:
+      validateTunnelOfferPayload(payload);
+      break;
+    case MSG.TUNNEL_ACCEPT:
+      validateTunnelAcceptPayload(payload);
+      break;
+    case MSG.TUNNEL_TEARDOWN:
+      validateTunnelTeardownPayload(payload);
+      break;
+    case MSG.TUNNEL_ERROR:
+      validateTunnelErrorPayload(payload);
+      break;
+    // TUNNEL_ESTABLISHED, TUNNEL_HEARTBEAT — minimal validation, mostly metrics
+    default:
+      break;
+  }
+}
+
+function validateTunnelRequestPayload(payload) {
+  if (typeof payload.primary_domain !== 'string' || !DOMAIN_RE.test(payload.primary_domain)) {
+    throw new Error('Invalid primary_domain format');
+  }
+  if (payload.domain_aliases !== undefined) {
+    if (!Array.isArray(payload.domain_aliases)) {
+      throw new Error('domain_aliases must be array');
+    }
+    for (const alias of payload.domain_aliases) {
+      if (typeof alias !== 'string' || !DOMAIN_RE.test(alias)) {
+        throw new Error(`Invalid domain alias format: ${alias}`);
+      }
+    }
+  }
+  if (typeof payload.client_wg_pubkey !== 'string' || !WG_PUBKEY_RE.test(payload.client_wg_pubkey)) {
+    throw new Error('Invalid client_wg_pubkey format');
+  }
+  if (!Array.isArray(payload.ports)) {
+    throw new Error('ports must be an array');
+  }
+}
+
+function validateTunnelOfferPayload(payload) {
+  if (typeof payload.tunnel_type !== 'string') {
+    throw new Error('Missing tunnel_type');
+  }
+  if (!Array.isArray(payload.transports) || payload.transports.length === 0) {
+    throw new Error('transports must be a non-empty array');
+  }
+  if (!payload.auth || typeof payload.auth !== 'object') {
+    throw new Error('Missing auth object');
+  }
+}
+
+function validateTunnelAcceptPayload(payload) {
+  if (typeof payload.accepted_tunnel_type !== 'string') {
+    throw new Error('Missing accepted_tunnel_type');
+  }
+  if (typeof payload.accepted_transport !== 'string') {
+    throw new Error('Missing accepted_transport');
+  }
+}
+
+function validateTunnelTeardownPayload(payload) {
+  if (typeof payload.reason !== 'string') {
+    throw new Error('Missing teardown reason');
+  }
+}
+
+function validateTunnelErrorPayload(payload) {
+  if (typeof payload.error_code !== 'string') {
+    throw new Error('Missing error_code');
+  }
 }
 
 import { hostname as _getHostname } from 'node:os';

@@ -121,11 +121,14 @@ async function main() {
   }
 
   // Start health monitor loop (checks WireGuard handshake staleness)
-  startHealthMonitor(sessionManager, ipPool, config, nostrClient);
+  const healthMonitorInterval = startHealthMonitor(sessionManager, ipPool, config, nostrClient);
 
   // Handle shutdown
   const shutdown = async () => {
     log('Shutting down...');
+
+    // Stop health monitor
+    if (healthMonitorInterval) clearInterval(healthMonitorInterval);
 
     // Teardown all active sessions
     for (const session of sessionManager.getActiveSessions()) {
@@ -157,6 +160,21 @@ async function handleTunnelRequest(senderNpub, message, config, acl, ipPool,
   const payload = message.payload;
   const primaryDomain = payload.primary_domain;
   const aliases = payload.domain_aliases || [];
+
+  // Check if this correlation ID is tombstoned (already torn down)
+  if (sessionManager.isTombstoned(message.correlation_id)) {
+    log(`Ignoring TUNNEL_REQUEST with tombstoned correlation ${message.correlation_id}`);
+    return;
+  }
+
+  // If an existing session for this client+domain is DRAINING, cancel it
+  // so the IP can be re-used for the new session
+  const existingKey = `${senderNpub}:${primaryDomain}`;
+  const existingSession = sessionManager.sessions.get(existingKey);
+  if (existingSession && existingSession.state === 'DRAINING') {
+    sessionManager.cancelDraining(existingSession);
+    log(`Cancelled DRAINING session for ${existingKey} to re-negotiate`);
+  }
 
   // Validate ACL
   const aclResult = checkAcl(acl, senderNpub, primaryDomain, aliases);
@@ -205,8 +223,9 @@ async function handleTunnelRequest(senderNpub, message, config, acl, ipPool,
     return;
   }
 
-  // Create session
-  const session = sessionManager.getOrCreate(senderNpub, primaryDomain, message.correlation_id);
+  // Create session (pass cleanup callback so existing sessions release resources)
+  const session = sessionManager.getOrCreate(senderNpub, primaryDomain, message.correlation_id,
+    (s) => sessionCleanup(s, ipPool, config));
   session.peerIp = peerIp;
   session.clientWgPubkey = payload.client_wg_pubkey;
   session.aliases = aliases;
@@ -305,6 +324,11 @@ async function handleTunnelAccept(senderNpub, message, sessionManager, config,
     return;
   }
 
+  if (session.state !== 'OFFERED') {
+    log(`Ignoring TUNNEL_ACCEPT for session in ${session.state} state`);
+    return;
+  }
+
   session.transport = message.payload?.accepted_transport || 'udp';
 
   // Add WireGuard peer
@@ -344,6 +368,11 @@ async function handleTunnelEstablished(senderNpub, message, sessionManager) {
     return;
   }
 
+  if (session.state !== 'ACCEPTING') {
+    log(`Ignoring TUNNEL_ESTABLISHED for session in ${session.state} state`);
+    return;
+  }
+
   // Verify health via the client's health endpoint
   const healthEndpoint = message.payload?.health_endpoint;
   if (healthEndpoint) {
@@ -361,6 +390,11 @@ async function handleTunnelEstablished(senderNpub, message, sessionManager) {
 async function handleTunnelHeartbeat(senderNpub, message, sessionManager) {
   const session = sessionManager.findByCorrelation(message.correlation_id);
   if (!session) return;
+
+  // Silently ignore heartbeats for non-active sessions
+  if (session.state !== 'ACTIVE' && session.state !== 'DRAINING') {
+    return;
+  }
 
   sessionManager.recordHeartbeat(session);
 
@@ -416,7 +450,7 @@ function sessionCleanup(session, ipPool, config) {
  * Checks WireGuard handshake staleness and initiates draining.
  */
 function startHealthMonitor(sessionManager, ipPool, config, nostrClient) {
-  setInterval(() => {
+  return setInterval(() => {
     const handshakes = wgManager.getPeerHandshakes();
     const now = Math.floor(Date.now() / 1000);
 
