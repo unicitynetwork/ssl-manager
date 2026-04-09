@@ -200,7 +200,7 @@ This message is the client's confirmation that it has successfully brought up th
 
 **DM heartbeats are for status reporting, NOT liveness detection.** WireGuard's built-in `PersistentKeepalive` (25s) and the `wg show wg0 latest-handshake` command provide authoritative tunnel liveness signals without any relay traffic. DM heartbeats are sent every 15 minutes (configurable) for status updates and metrics.
 
-The server monitors tunnel liveness via WireGuard handshake timestamps directly (not via DM heartbeats). If a peer's handshake is stale for longer than `heartbeat_missed_limit * heartbeat_interval_seconds`, the server enters DRAINING state (see Section 4.2).
+The server monitors tunnel liveness via WireGuard handshake timestamps directly (not via DM heartbeats). If a peer's WireGuard handshake is stale for longer than `tunnel_stale_threshold_seconds` (default: 2700 seconds / 45 minutes), the server enters DRAINING state (see Section 4.2). This threshold is independent of the DM heartbeat interval.
 
 **Metrics in heartbeats are optional.** Omitting them reduces metadata leakage on public relays. If privacy is a concern, send heartbeats with `metrics: null`.
 
@@ -244,6 +244,55 @@ Reason codes: `ERR_CAPACITY`, `ERR_ACL_DENIED`, `ERR_DOMAIN_UNAUTHORIZED`, `ERR_
 ```
 
 `recoverable` signals whether the sender believes the session can continue. If `false`, the receiver SHOULD treat this as equivalent to TUNNEL_TEARDOWN with reason `ERROR`. `suggested_action` is advisory: one of `RETRY_DNS`, `RETRY_TUNNEL`, `WAIT`, `CONTACT_ADMIN`.
+
+### 3.9 TUNNEL_CONFIG_UPDATE (server → client)
+
+```json
+{
+  "updated_fields": {
+    "haproxy_public_ip": "203.0.113.10"
+  },
+  "reason": "IP_CHANGE",
+  "message": "HAProxy public IP changed due to failover"
+}
+```
+
+A **state-transition message** (buffered for reordering, see Section 4.5). Sent when the server's configuration changes in a way that affects the client (e.g., public IP change, port reallocation). The client MUST update its DNS records and acknowledge by sending a TUNNEL_HEARTBEAT with the updated config reflected. If the client does not acknowledge within 5 minutes, the server MAY send TUNNEL_TEARDOWN.
+
+### 3.10 TUNNEL_MAINTENANCE_NOTICE (server → client)
+
+```json
+{
+  "maintenance_at": "2026-04-10T02:00:00Z",
+  "expected_duration_seconds": 600,
+  "action": "TEARDOWN_AND_RECONNECT",
+  "message": "Scheduled WireGuard key rotation"
+}
+```
+
+A **state-transition message**. Advance warning of planned server maintenance. The client can use this to drain connections and prepare for a brief outage. The server will send TUNNEL_TEARDOWN at or after `maintenance_at`. The client should reconnect automatically after the maintenance window. If `maintenance_at` is in the past, the client SHOULD treat this as an immediate teardown notification.
+
+### 3.11 SSH Reverse Tunnel Auth Schema (Lite Mode)
+
+When `tunnel_type` is `"ssh-reverse"` (lite mode), the `auth` field in TUNNEL_OFFER uses this schema instead of the WireGuard schema:
+
+```json
+{
+  "auth": {
+    "ssh_host": "198.51.100.42",
+    "ssh_port": 2222,
+    "ssh_user": "ssl-tunnel",
+    "ssh_host_key_fingerprint": "SHA256:abc123...",
+    "forwarded_ports": [
+      { "remote_bind": "127.0.0.1:21080", "local_port": 80, "description": "http" },
+      { "remote_bind": "127.0.0.1:21443", "local_port": 443, "description": "https" },
+      { "remote_bind": "127.0.0.1:21444", "local_port": 8444, "description": "alias-proxy" }
+    ]
+  }
+}
+```
+
+The client MUST verify `ssh_host_key_fingerprint` against the SSH handshake. Mismatch MUST abort and send TUNNEL_ERROR. The `transports` array is not applicable for SSH mode (SSH provides its own transport). The client uses `autossh` for automatic reconnection.
 
 ---
 
@@ -363,7 +412,7 @@ Reason codes: `ERR_CAPACITY`, `ERR_ACL_DENIED`, `ERR_DOMAIN_UNAUTHORIZED`, `ERR_
 | ACCEPTING | **Server** | **180 seconds** | **Free allocated WG peer/iptables/backends, TEARING_DOWN** |
 | ESTABLISHING | Client | 120 seconds | Send TUNNEL_ERROR (recoverable=false) **immediately on wg-quick failure**, teardown |
 | ACTIVE | Client | WG handshake stale >3 min | Initiate RECONNECTING |
-| ACTIVE | Server | WG handshake stale >45 min | Enter DRAINING (120s grace) |
+| ACTIVE | Server | WG handshake stale > `tunnel_stale_threshold_seconds` (default 2700s / 45min) | Enter DRAINING (120s grace) |
 | DRAINING | Server | 120 seconds | TEARING_DOWN |
 | RECONNECTING | Client | 300 seconds | Send TUNNEL_TEARDOWN, return to IDLE |
 | TEARING_DOWN | Both | 30 seconds | Force-close tunnel interface, add to tombstone cache |
@@ -387,7 +436,7 @@ All retries use truncated exponential backoff: wait `min(2^attempt * base_second
 
 Nostr relays do NOT guarantee message ordering. A message sent second may arrive first if delivered via a different relay.
 
-**State-transition messages** (TUNNEL_REQUEST, TUNNEL_OFFER, TUNNEL_ACCEPT, TUNNEL_ESTABLISHED, TUNNEL_TEARDOWN) are order-sensitive — processing them out of order can skip or break state transitions. Rule: if a state-transition message arrives with a sequence number higher than expected, the receiver MUST buffer it for up to **10 seconds** waiting for the missing message(s). If the gap is not filled within 10 seconds, process the buffered message and discard the missing one (it will be rejected if it arrives later due to sequence enforcement).
+**State-transition messages** (TUNNEL_REQUEST, TUNNEL_OFFER, TUNNEL_ACCEPT, TUNNEL_ESTABLISHED, TUNNEL_TEARDOWN, TUNNEL_CONFIG_UPDATE, TUNNEL_MAINTENANCE_NOTICE) are order-sensitive — processing them out of order can skip or break state transitions. Rule: if a state-transition message arrives with a sequence number higher than expected, the receiver MUST buffer it for up to **10 seconds** waiting for the missing message(s). If the gap is not filled within 10 seconds, process the buffered message and discard the missing one (it will be rejected if it arrives later due to sequence enforcement).
 
 **Heartbeat messages** are NOT order-sensitive. Strict sequence enforcement applies — out-of-order heartbeats are silently dropped. This is safe because heartbeats are periodic and losing one is tolerable.
 
@@ -442,7 +491,7 @@ Client                          Nostr Relay                     Server (HAProxy)
   │   tunnel liveness — no DMs)      │                                │
 ```
 
-### 5.3 Reconnection Scenario
+### 5.2 Reconnection Scenario
 
 ```
 Client                                                          Server
@@ -478,7 +527,7 @@ Client                                                          Server
   │                                                               │  cancel DRAINING if active]
 ```
 
-### 5.4 Rejection and Graceful Teardown
+### 5.3 Rejection and Graceful Teardown
 
 ```
 Client                                                          Server
@@ -554,33 +603,6 @@ For SSH-based tunnels, the client MUST verify the server's host key fingerprint 
 
 There are no `TUNNEL_DNS_REQUEST` or `TUNNEL_DNS_RESPONSE` message types. The protocol does not include DNS operations — they are handled entirely by the client through standard outbound internet connectivity provided by the tunnel.
 
-### 3.9 TUNNEL_CONFIG_UPDATE (server → client)
-
-```json
-{
-  "updated_fields": {
-    "haproxy_public_ip": "203.0.113.10"
-  },
-  "reason": "IP_CHANGE",
-  "message": "HAProxy public IP changed due to failover"
-}
-```
-
-Sent when the server's configuration changes in a way that affects the client (e.g., public IP change, port reallocation). The client MUST update its DNS records and acknowledge by sending a TUNNEL_HEARTBEAT with the updated config reflected. If the client does not acknowledge within 5 minutes, the server MAY send TUNNEL_TEARDOWN.
-
-### 3.10 TUNNEL_MAINTENANCE_NOTICE (server → client)
-
-```json
-{
-  "maintenance_at": "2026-04-10T02:00:00Z",
-  "expected_duration_seconds": 600,
-  "action": "TEARDOWN_AND_RECONNECT",
-  "message": "Scheduled WireGuard key rotation"
-}
-```
-
-Advance warning of planned server maintenance. The client can use this to drain connections and prepare for a brief outage. The server will send TUNNEL_TEARDOWN at or after `maintenance_at`. The client should reconnect automatically after the maintenance window.
-
 ---
 
 ## 8. Extensibility Considerations
@@ -627,3 +649,4 @@ A future extension could allow servers to forward TUNNEL_REQUEST to peer servers
 | `ERR_TIMESTAMP_SKEW` | Both | Timestamp outside ±2 minute window |
 | `ERR_SIGNATURE_MISMATCH` | Both | sender_npub does not match NIP-17 inner pubkey |
 | `ERR_SESSION_CONFLICT` | S→C | Client already has an active session for this domain |
+| `ERR_CONFIG_UPDATE_FAILED` | C→S | Client could not apply configuration update |

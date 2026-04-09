@@ -205,11 +205,13 @@ The critical requirement is **full bidirectional network transparency** — the 
 - **No per-port config:** HAProxy routes to WireGuard peer IP directly by domain name
 - **Multi-alias support:** Single peer connection serves all domains and ports
 
-**Integration pattern:**
+**Integration pattern** (with split routing — Docker DNS and bridge networks excluded via PostUp rules; see architecture.md Section 5 for details):
 ```ini
 [Interface]
 PrivateKey = <client-private-key>
 Address = 10.200.0.2/32
+PostUp = ip rule add to 127.0.0.11/32 lookup main priority 9
+PostUp = ip rule add to 172.16.0.0/12 lookup main priority 11
 
 [Peer]
 PublicKey = <server-public-key>
@@ -219,7 +221,7 @@ AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 ```
 
-**Trade-off:** Requires `NET_ADMIN` capability and Linux 5.6+ kernel. Adds ~5MB to base image.
+**Trade-off:** Requires `NET_ADMIN` capability, `/dev/net/tun`, and Linux 5.6+ kernel (or wireguard-go fallback). Available only in `ssl-manager:tunnel` image variant.
 
 ### ALTERNATIVE 1: SSH tun device (`ssh -w`)
 

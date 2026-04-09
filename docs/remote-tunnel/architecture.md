@@ -354,7 +354,7 @@ tunnel-manager auto-detects Docker bridge subnets by inspecting the container's 
    - HAProxy API URL (via WireGuard IP) with domain-scoped session token
 5. tunnel-manager writes WireGuard config with split-routing PostUp rules and brings up `wg0`.
 6. tunnel-manager verifies connectivity: pings `10.200.0.1`, then `curl http://10.200.0.1:8404/v1/health`.
-7. tunnel-manager sends `TUNNEL_ESTABLISHED` DM (with `accepted_transport`).
+7. tunnel-manager sends `TUNNEL_ESTABLISHED` DM.
 8. tunnel-manager writes `/tmp/.ssl-tunnel-env` and signals ssl-setup to proceed.
 
 ### Monitoring
@@ -379,6 +379,12 @@ Two layers of health monitoring:
 4. If still unreachable after 90 seconds: send new `TUNNEL_REQUEST` DM with same idempotency key
 5. Client adds random jitter (0-60 seconds) before reconnection to avoid thundering herd on HAProxy reboot
 6. After `TUNNEL_RECONNECT_MAX` total failures: signal fatal error to ssl-setup (exit 16)
+
+### Server-Initiated Changes
+
+The server may send `TUNNEL_CONFIG_UPDATE` if its public IP changes (failover, elastic IP reassignment). The client must update its DNS records and acknowledge via heartbeat. If the client does not acknowledge within 5 minutes, the server may teardown.
+
+The server may send `TUNNEL_MAINTENANCE_NOTICE` before planned downtime, giving the client advance warning to drain connections. After the maintenance window, the client reconnects automatically.
 
 ### Teardown
 
@@ -405,7 +411,7 @@ BOOTSTRAPPING
   ▼
 NEGOTIATING
   │ Send TUNNEL_REQUEST via Sphere SDK DM
-  │ Wait up to 60s for TUNNEL_OFFER or TUNNEL_REJECTED
+  │ Wait up to 90s for TUNNEL_OFFER or TUNNEL_REJECTED
   │ On REJECTED with retry_after: sleep, retry (max 3 attempts)
   │ On timeout: retry with backoff (30s, 60s, 120s)
   ▼
@@ -533,25 +539,27 @@ WireGuard provides:
 Each client peer gets a unique `/32` IP within the 10.200.0.0/24 subnet. The HAProxy host's iptables rules are **explicitly restrictive**:
 
 ```bash
-# Allow forwarding from WireGuard subnet to internet (MASQUERADE)
+# NAT masquerade for client egress
 iptables -t nat -A POSTROUTING -s 10.200.0.0/24 -o eth0 -j MASQUERADE
 
-# DENY inter-peer traffic
+# --- FORWARD chain rules (ORDER MATTERS — first match wins) ---
+
+# ALLOW: WireGuard peers to HAProxy API (must be BEFORE the 10.0.0.0/8 DROP)
+iptables -A FORWARD -s 10.200.0.0/24 -d 10.200.0.1 -p tcp --dport 8404 -j ACCEPT
+
+# DENY: inter-peer traffic (clients cannot reach each other)
 iptables -A FORWARD -s 10.200.0.0/24 -d 10.200.0.0/24 -j DROP
 
-# DENY access to private subnets (Docker networks, host services)
+# DENY: cloud metadata endpoint (AWS/GCP/Azure instance metadata)
+iptables -A FORWARD -s 10.200.0.0/24 -d 169.254.169.254 -j DROP
+
+# DENY: private subnets (Docker networks, host services, other internal)
 iptables -A FORWARD -s 10.200.0.0/24 -d 172.16.0.0/12 -j DROP
 iptables -A FORWARD -s 10.200.0.0/24 -d 192.168.0.0/16 -j DROP
 iptables -A FORWARD -s 10.200.0.0/24 -d 10.0.0.0/8 -j DROP
 
-# ALLOW exception: WireGuard subnet to HAProxy API
-iptables -A FORWARD -s 10.200.0.0/24 -d 10.200.0.1 -p tcp --dport 8404 -j ACCEPT
-
-# DENY cloud metadata endpoint
-iptables -A FORWARD -s 10.200.0.0/24 -d 169.254.169.254 -j DROP
-
-# ALLOW internet-routable destinations only
-iptables -A FORWARD -s 10.200.0.0/24 ! -d 10.0.0.0/8 -j ACCEPT
+# ALLOW: internet-routable destinations (everything not matched above)
+iptables -A FORWARD -s 10.200.0.0/24 -j ACCEPT
 ```
 
 **Rationale:** Without these restrictions, a compromised container becomes an open proxy through the HAProxy host — able to scan Docker networks, access cloud metadata, and attack other services. The rules ensure clients can only reach the public internet and the HAProxy API.
@@ -613,9 +621,10 @@ The `haproxy_api.session_key` in TUNNEL_OFFER is **scoped to the domains in the 
 When `--remote-haproxy-id` is set, `run-lib.sh` automatically:
 - Suppresses `--haproxy-host` Docker network wiring (no haproxy-net)
 - Removes `-p 80:80` port publishing (traffic arrives through tunnel)
-- Adds `--cap-add=NET_ADMIN` (required for WireGuard in full mode)
-- Adds `--device /dev/net/tun:/dev/net/tun` (required for WireGuard tun interface)
-- Adds `--sysctl net.ipv4.conf.all.src_valid_mark=1` (WireGuard policy routing)
+- **Full mode only** (`TUNNEL_MODE != lite`):
+  - Adds `--cap-add=NET_ADMIN` (required for WireGuard)
+  - Adds `--device /dev/net/tun:/dev/net/tun` (required for WireGuard tun interface)
+  - Adds `--sysctl net.ipv4.conf.all.src_valid_mark=1` (WireGuard policy routing)
 
 ### HAProxy Daemon Configuration (haproxy-tunnel-daemon sidecar)
 
