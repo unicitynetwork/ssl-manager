@@ -190,7 +190,115 @@ The critical requirement is **bidirectional full-network transparency**: the con
 
 ---
 
-## 4. Tunnel Lifecycle
+## 4. Transport Layer: Handling Restrictive Networks
+
+### The Problem
+
+WireGuard uses **UDP** (default port 51820). Many restrictive network environments block non-standard UDP:
+- Corporate firewalls often allow only TCP 80/443 (HTTP/HTTPS)
+- Hotel/airport WiFi frequently blocks all non-HTTP traffic
+- Some ISPs throttle or block unrecognized UDP protocols
+- HTTP proxies (common in enterprises) only support TCP CONNECT
+
+### Solution: Layered Transport with wstunnel
+
+We use a **layered architecture** — WireGuard remains the VPN layer, but its UDP traffic is optionally wrapped in a WebSocket (WSS) transport using **wstunnel** when direct UDP is blocked:
+
+```
+OPEN NETWORK (direct UDP):
+  Container wg0 ──UDP──► Server:51820 (WireGuard)
+
+RESTRICTIVE NETWORK (WebSocket wrapper):
+  Container wg0 ──UDP──► localhost:51820 (wstunnel client)
+                              │
+                         WSS over TCP 443
+                         (looks like HTTPS)
+                              │
+                              ▼
+                         Server wstunnel ──UDP──► localhost:51820 (WireGuard)
+```
+
+**Why layered beats a standalone WebSocket VPN:**
+- WireGuard config, key management, and operations are identical regardless of transport
+- No code changes to tunnel-manager — only the WireGuard endpoint changes (direct vs. localhost)
+- wstunnel adds only ~2-3% overhead and ~15-20ms latency
+- Traffic looks like normal HTTPS to firewalls and DPI
+- Works through HTTP CONNECT proxies
+- Can be enabled/disabled without touching the VPN layer
+
+### Transport Negotiation
+
+The `TUNNEL_OFFER` message includes available transports:
+
+```json
+{
+  "transports": [
+    { "type": "udp",       "endpoint": "198.51.100.42:51820" },
+    { "type": "wss",       "endpoint": "wss://198.51.100.42:443/tunnel" },
+    { "type": "wss-proxy", "endpoint": "wss://198.51.100.42:443/tunnel",
+                           "proxy_compatible": true }
+  ]
+}
+```
+
+tunnel-manager tries transports in order:
+1. **Direct UDP** — fastest, try first (5-second handshake timeout)
+2. **WSS** — if UDP fails, start wstunnel client, connect via WebSocket on port 443
+3. **WSS via HTTP proxy** — if WSS direct fails, try through `HTTP_PROXY`/`HTTPS_PROXY` environment variables
+
+The client can force a specific transport via `TUNNEL_TRANSPORT=wss` environment variable (useful when the client knows its network blocks UDP).
+
+### wstunnel Integration
+
+**Client side** (inside ssl-manager container):
+```bash
+# wstunnel wraps WireGuard UDP in WebSocket
+wstunnel client \
+  --udp-to-wss "127.0.0.1:51820:127.0.0.1:51820" \
+  wss://198.51.100.42:443/tunnel
+```
+
+WireGuard config changes only the endpoint:
+```ini
+[Peer]
+# Direct UDP:   Endpoint = 198.51.100.42:51820
+# Via wstunnel: Endpoint = 127.0.0.1:51820   ← local wstunnel client
+```
+
+**Server side** (inside HAProxy container):
+```bash
+# wstunnel unwraps WebSocket back to UDP for WireGuard
+wstunnel server \
+  --restrict-to "127.0.0.1:51820" \
+  wss://0.0.0.0:443/tunnel
+```
+
+The `--restrict-to` flag ensures the WebSocket tunnel can only forward to the WireGuard port — no arbitrary port access.
+
+### DPI Evasion Properties
+
+| Property | Direct UDP | WSS via wstunnel |
+|----------|-----------|------------------|
+| Protocol visible to firewall | WireGuard/UDP | HTTPS/WebSocket |
+| Port | 51820 (non-standard) | 443 (standard HTTPS) |
+| TLS encryption | WireGuard only | TLS 1.3 outer + WireGuard inner |
+| Survives DPI | No (WireGuard fingerprinted) | Yes (looks like HTTPS) |
+| Works through HTTP proxy | No | Yes (CONNECT tunnel) |
+| Latency overhead | 0 | +15-20ms |
+| Throughput | Native | ~97% of native |
+
+### For Extreme DPI Environments
+
+If even WebSocket traffic is fingerprinted (rare, but possible in state-level censorship), **sing-box** can be used as an alternative transport with VLESS/Trojan protocols that are designed to be indistinguishable from normal HTTPS browsing traffic. This is a future extension — wstunnel covers 99% of restrictive networks.
+
+### New Dependencies
+
+- `wstunnel` — Rust binary, ~5-8MB, statically compiled. Installed in base image alongside wireguard-tools.
+- Total additional image size for tunnel support: ~10-13MB (wireguard-tools + wstunnel).
+
+---
+
+## 5. Tunnel Lifecycle
 
 ### Establishment
 
@@ -289,7 +397,7 @@ TEARING_DOWN (on SIGTERM from container shutdown)
 
 ---
 
-## 5. Dynamic DNS Integration
+## 6. Dynamic DNS Integration
 
 ### Principle: Client Owns Its DNS
 
@@ -328,7 +436,7 @@ If the client's domain already points to the HAProxy's public IP (manually confi
 
 ---
 
-## 6. SSL Certificate Flow Through Tunnel
+## 7. SSL Certificate Flow Through Tunnel
 
 The certificate flow is **identical to local mode** because the WireGuard tunnel provides full bidirectional connectivity. From certbot's and ssl-setup's perspective, nothing has changed:
 
@@ -345,7 +453,7 @@ The certificate flow is **identical to local mode** because the WireGuard tunnel
 
 ---
 
-## 7. Security Model
+## 8. Security Model
 
 ### Identity and Authentication
 
@@ -386,7 +494,7 @@ Each client peer gets a unique `/32` IP within the 10.200.0.0/24 subnet. WireGua
 
 ---
 
-## 8. Configuration
+## 9. Configuration
 
 ### New Environment Variables (in-container)
 
@@ -398,6 +506,7 @@ Each client peer gets a unique `/32` IP within the 10.200.0.0/24 subnet. WireGua
 | `TUNNEL_NEGOTIATE_TIMEOUT` | `60` | Seconds to wait for `TUNNEL_OFFER` before timeout and retry. |
 | `TUNNEL_HEARTBEAT_INTERVAL` | `300` | Seconds between `TUNNEL_HEARTBEAT` DMs. |
 | `TUNNEL_RECONNECT_MAX` | `10` | Maximum reconnection attempts before fatal exit. |
+| `TUNNEL_TRANSPORT` | _(auto)_ | Force transport: `udp` (direct WireGuard), `wss` (WebSocket wrapper), or `auto` (try UDP first, fall back to WSS). |
 | `DYNDNS_PROVIDER` | _(empty)_ | Client's DynDNS provider (e.g., `cloudflare`, `route53`). Client manages its own DNS. |
 | `DYNDNS_CREDENTIALS` | _(empty)_ | Client's DynDNS API credentials (provider-specific). Never sent to HAProxy. |
 
@@ -407,6 +516,7 @@ Each client peer gets a unique `/32` IP within the 10.200.0.0/24 subnet. WireGua
 |------|-------------|-------------|
 | `--remote-haproxy-id <npub>` | `REMOTE_HAPROXY_ID` | Enable remote tunnel mode targeting this HAProxy daemon. |
 | `--tunnel-relay <url>` | `TUNNEL_RELAY_URLS` | Override Nostr relay URLs (comma-separated). |
+| `--tunnel-transport <type>` | `TUNNEL_TRANSPORT` | Force transport: `udp`, `wss`, or `auto` (default). |
 | `--dyndns-provider <name>` | `DYNDNS_PROVIDER` | Client's DynDNS provider for self-managed DNS. |
 
 When `--remote-haproxy-id` is set, `run-lib.sh` automatically:
@@ -430,12 +540,13 @@ When `--remote-haproxy-id` is set, `run-lib.sh` automatically:
 ### New Dockerfile Dependencies
 
 - `wireguard-tools` — WireGuard CLI (`wg`, `wg-quick`). ~5MB.
+- `wstunnel` — Rust binary for wrapping WireGuard UDP in WebSocket. ~5-8MB static binary. Used when direct UDP is blocked by restrictive firewalls.
 - `node` + `sphere-sdk` — For Sphere SDK DM communication. Installed in base image or as optional layer.
 - `iptables` — For NAT masquerade (usually already present in Debian).
 
 ---
 
-## 9. Error Handling and Failure Modes
+## 10. Error Handling and Failure Modes
 
 ### New Exit Codes for ssl-setup
 
@@ -463,7 +574,7 @@ When `--remote-haproxy-id` is set, `run-lib.sh` automatically:
 
 ---
 
-## 10. Integration with Existing ssl-setup.sh Flow
+## 11. Integration with Existing ssl-setup.sh Flow
 
 ### Modified ssl-setup.sh Flow
 
@@ -519,7 +630,7 @@ Derived image entrypoints require no modification. The ssl-setup exit code contr
 
 ---
 
-## 11. Key Architectural Decisions
+## 12. Key Architectural Decisions
 
 **Why WireGuard over SSH port forwarding?** The requirement for bidirectional full-network transparency rules out SSH `-R`. The container must route ALL traffic (inbound and outbound) through the HAProxy host so that DynDNS calls, certbot ACME validation, and arbitrary outbound connections work as if the container is on the HAProxy's network. WireGuard provides this as a true VPN tunnel with minimal overhead. SSH would require bolting on SOCKS proxying, DNS forwarding, and per-service configuration — more complex than WireGuard.
 

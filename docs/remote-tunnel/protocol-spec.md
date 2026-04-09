@@ -72,6 +72,7 @@ Every DTNP message is a JSON object with the following envelope:
     { "protocol": "tcp",   "client_port": 50002, "label": "electrum-ssl" }
   ],
   "tunnel_preference": ["wireguard", "ssh-tun"],
+  "transport_preference": ["auto", "udp", "wss"],
   "client_wg_pubkey": "<base64-wireguard-public-key>",
   "client_meta": {
     "hostname": "fulcrum-alpha-1",
@@ -99,10 +100,11 @@ The `tunnel_preference` list is ordered from most preferred to least. WireGuard 
 ```json
 {
   "tunnel_type": "wireguard",
-  "endpoint": {
-    "host": "198.51.100.42",
-    "port": 51820
-  },
+  "transports": [
+    { "type": "udp",       "endpoint": "198.51.100.42:51820" },
+    { "type": "wss",       "endpoint": "wss://198.51.100.42:443/tunnel" },
+    { "type": "wss-proxy", "endpoint": "wss://198.51.100.42:443/tunnel", "proxy_compatible": true }
+  ],
   "auth": {
     "server_wg_pubkey": "base64-wireguard-pubkey",
     "client_ip_alloc": "10.200.0.2/32",

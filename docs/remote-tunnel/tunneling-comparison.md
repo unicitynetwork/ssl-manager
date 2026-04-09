@@ -39,7 +39,7 @@ autossh -M 0 -o ServerAliveInterval=30 \
 
 ---
 
-### 2. WireGuard
+### 2. WireGuard (+ wstunnel for restrictive networks)
 
 **Security:** Excellent. Modern AEAD ciphers (ChaCha20, Poly1305), Ed25519 elliptic curve keys. Academic review conducted. Minimal code surface. Full tunnel isolation.
 
@@ -49,13 +49,19 @@ autossh -M 0 -o ServerAliveInterval=30 \
 
 **Automated Setup:** Generate keypairs, bring up wg0 interface, configure routes. Straightforward but requires networking knowledge.
 
-**NAT/Firewall Traversal:** Excellent. Designed for NAT traversal. Single UDP port, configurable. PersistentKeepalive sends periodic packets through NAT.
+**NAT/Firewall Traversal:** Good natively (UDP). **Excellent with wstunnel** — wraps WireGuard UDP in WebSocket (WSS on port 443), making it indistinguishable from HTTPS traffic. Works through corporate HTTP proxies. wstunnel adds only ~2-3% overhead and ~15-20ms latency.
 
 **Reconnection:** Robust. Peer detection and keepalive automatic. On network change, detects new IP and reconnects transparently.
 
-**Maturity:** Production-ready. In Linux kernel since 5.6 (2020). Regular security audits. Growing enterprise adoption.
+**Maturity:** Production-ready. In Linux kernel since 5.6 (2020). Regular security audits. Growing enterprise adoption. wstunnel is a mature Rust binary, actively maintained.
 
-**Limitations:** Requires networking knowledge. Kernel dependency. Docker gotcha: CAP_NET_ADMIN or host networking limits security benefits.
+**Limitations:** Requires networking knowledge. Kernel dependency. Docker gotcha: CAP_NET_ADMIN or host networking limits security benefits. UDP blocked in restrictive networks (mitigated by wstunnel).
+
+**With wstunnel transport layer:**
+```
+Direct UDP:  Container wg0 ──UDP──► Server:51820
+Via wstunnel: Container wg0 ──UDP──► localhost:51820 (wstunnel) ──WSS/443──► Server wstunnel ──UDP──► WireGuard
+```
 
 ---
 
