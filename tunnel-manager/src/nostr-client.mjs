@@ -179,7 +179,9 @@ export class NostrClient {
 
       const handler = (msg) => {
         if (settled) return;
-        if (msg.msg_type === msgType && msg.correlation_id === correlationId) {
+        const typeMatch = !msgType || msg.msg_type === msgType;
+        const corrMatch = !correlationId || msg.correlation_id === correlationId;
+        if (typeMatch && corrMatch) {
           settled = true;
           clearTimeout(timer);
           resolve(msg);
