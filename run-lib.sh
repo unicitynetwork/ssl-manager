@@ -267,7 +267,8 @@ _ssl_start_container() {
         _read_docker_args all_env app_env_args
     fi
     if type app_port_args &>/dev/null; then
-        if ! { [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; }; then
+        if ! { [ "$USE_TUNNEL" = true ] && [ -n "$REMOTE_HAPROXY_ID" ]; } && \
+           ! { [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; }; then
             _read_docker_args all_ports app_port_args
         fi
     fi
