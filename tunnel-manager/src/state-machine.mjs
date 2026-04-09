@@ -5,6 +5,7 @@
  * ESTABLISHING -> ACTIVE -> RECONNECTING -> TEARING_DOWN -> IDLE
  */
 
+import { writeFileSync, unlinkSync } from 'node:fs';
 import { CLIENT_STATE, MSG, TIMEOUTS, RETRY, EXIT_CODES, TEARDOWN_REASONS } from './constants.mjs';
 import {
   buildTunnelRequest,
@@ -82,7 +83,6 @@ export class TunnelStateMachine {
    */
   _writeStateFile() {
     try {
-      const { writeFileSync } = require('node:fs');
       writeFileSync('/tmp/.ssl-tunnel-state', JSON.stringify({
         state: this.state,
         correlationId: this.correlationId,
@@ -439,7 +439,6 @@ export class TunnelStateMachine {
    * Write /tmp/.ssl-tunnel-env for ssl-setup to source.
    */
   _writeTunnelEnv() {
-    const { writeFileSync } = require('node:fs');
     const haproxyApi = this.offer?.payload?.haproxy_api;
 
     const env = [
@@ -635,7 +634,6 @@ export class TunnelStateMachine {
 
     // Remove env file
     try {
-      const { unlinkSync } = require('node:fs');
       unlinkSync('/tmp/.ssl-tunnel-env');
     } catch {}
 

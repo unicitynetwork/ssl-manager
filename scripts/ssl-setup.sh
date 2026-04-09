@@ -102,12 +102,12 @@ if [[ -n "${REMOTE_HAPROXY_ID:-}" ]]; then
     _tunnel_timeout="${TUNNEL_NEGOTIATE_TIMEOUT:-300}"
     log "Starting tunnel-manager (timeout: ${_tunnel_timeout}s)..."
 
+    _tunnel_exit=0
     if command -v tunnel-manager &>/dev/null; then
-        tunnel-manager --start --wait-ready --timeout "$_tunnel_timeout"
+        tunnel-manager --start --wait-ready --timeout "$_tunnel_timeout" || _tunnel_exit=$?
     else
-        node /usr/local/bin/tunnel-manager/src/index.mjs --start --wait-ready --timeout "$_tunnel_timeout"
+        node /usr/local/bin/tunnel-manager/src/index.mjs --start --wait-ready --timeout "$_tunnel_timeout" || _tunnel_exit=$?
     fi
-    _tunnel_exit=$?
 
     if [[ "$_tunnel_exit" -ne 0 ]]; then
         die "$_tunnel_exit" "Tunnel establishment failed (exit code: ${_tunnel_exit})"

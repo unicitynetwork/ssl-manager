@@ -201,9 +201,11 @@ export function validateEnvelope(msg) {
   return { valid: true };
 }
 
+import { hostname as _getHostname } from 'node:os';
+
 function getHostname() {
   try {
-    return require('node:os').hostname();
+    return _getHostname();
   } catch {
     return 'unknown';
   }
