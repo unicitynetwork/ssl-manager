@@ -23,11 +23,12 @@ function err(msg) { console.error(`${LOG_PREFIX} ERROR: ${msg}`); }
 function httpRequestSync(method, urlStr, options = {}) {
   const { body = null, headers = {}, timeout = 10000 } = options;
 
-  // Build a self-contained Node script that makes the HTTP request
+  // Build a self-contained Node script that reads payload from stdin (avoids
+  // template literal injection -- JSON.stringify does not escape backticks)
   const scriptPayload = JSON.stringify({ method, urlStr, headers, body, timeout });
   const script = `
     const http = require('node:http');
-    const input = ${scriptPayload};
+    const input = JSON.parse(require('node:fs').readFileSync('/dev/stdin', 'utf-8'));
     const parsed = new URL(input.urlStr);
     const options = {
       hostname: parsed.hostname,
@@ -61,6 +62,7 @@ function httpRequestSync(method, urlStr, options = {}) {
   `;
 
   const result = execFileSync('node', ['-e', script], {
+    input: scriptPayload,
     encoding: 'utf-8',
     timeout: timeout + 5000,
     stdio: ['pipe', 'pipe', 'pipe'],

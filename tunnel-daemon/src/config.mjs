@@ -3,7 +3,7 @@
  */
 
 import { readFileSync, existsSync } from 'node:fs';
-import { execSync } from 'node:child_process';
+import { execSync, execFileSync } from 'node:child_process';
 
 export function loadConfig() {
   const config = {
@@ -43,7 +43,7 @@ export function loadConfig() {
   // Auto-detect public IP if not set
   if (!config.tunnelPublicIp) {
     try {
-      config.tunnelPublicIp = execSync('curl -sf https://ifconfig.me', {
+      config.tunnelPublicIp = execFileSync('curl', ['-sf', 'https://ifconfig.me'], {
         encoding: 'utf-8',
         timeout: 10000,
       }).trim();
