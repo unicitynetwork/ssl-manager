@@ -87,6 +87,45 @@ fi
 
 log "Starting SSL setup for domain: ${SSL_DOMAIN}"
 
+# ---------------------------------------------------------------------------
+# Step 0b: Remote tunnel mode detection
+# ---------------------------------------------------------------------------
+if [[ -n "${REMOTE_HAPROXY_ID:-}" ]]; then
+    log "Remote tunnel mode detected (REMOTE_HAPROXY_ID set)"
+    log "  Remote HAProxy: ${REMOTE_HAPROXY_ID:0:16}..."
+    log "  Tunnel mode: ${TUNNEL_MODE:-full}"
+
+    if ! command -v tunnel-manager &>/dev/null && ! command -v node &>/dev/null; then
+        die 16 "tunnel-manager not found. Use ssl-manager:tunnel image variant for remote HAProxy."
+    fi
+
+    _tunnel_timeout="${TUNNEL_NEGOTIATE_TIMEOUT:-300}"
+    log "Starting tunnel-manager (timeout: ${_tunnel_timeout}s)..."
+
+    if command -v tunnel-manager &>/dev/null; then
+        tunnel-manager --start --wait-ready --timeout "$_tunnel_timeout"
+    else
+        node /usr/local/bin/tunnel-manager/src/index.mjs --start --wait-ready --timeout "$_tunnel_timeout"
+    fi
+    _tunnel_exit=$?
+
+    if [[ "$_tunnel_exit" -ne 0 ]]; then
+        die "$_tunnel_exit" "Tunnel establishment failed (exit code: ${_tunnel_exit})"
+    fi
+
+    if [[ -f /tmp/.ssl-tunnel-env ]]; then
+        log "Sourcing tunnel environment from /tmp/.ssl-tunnel-env"
+        # shellcheck disable=SC1091
+        . /tmp/.ssl-tunnel-env
+        log "  HAPROXY_HOST=${HAPROXY_HOST:-<not set>}"
+        log "  HAPROXY_API_PORT=${HAPROXY_API_PORT:-<not set>}"
+        log "  TUNNEL_TYPE=${TUNNEL_TYPE:-<not set>}"
+        log "  TUNNEL_CLIENT_IP=${TUNNEL_CLIENT_IP:-<not set>}"
+    else
+        die 16 "Tunnel environment file /tmp/.ssl-tunnel-env not found after tunnel-manager"
+    fi
+fi
+
 # Parse domain aliases into an array
 ALL_SSL_DOMAINS=("$SSL_DOMAIN")
 if [[ -n "${SSL_DOMAIN_ALIASES:-}" ]]; then

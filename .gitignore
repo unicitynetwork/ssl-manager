@@ -1,0 +1,4 @@
+.claude
+node_modules/
+tunnel-manager/node_modules/
+tunnel-daemon/node_modules/

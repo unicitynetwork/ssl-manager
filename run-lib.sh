@@ -127,7 +127,15 @@ validate_port() {
 : "${HEALTH_TIMEOUT:=120}"
 : "${HEALTH_PORT:=80}"
 
+# Tunnel mode defaults
+: "${REMOTE_HAPROXY_ID:=}"
+: "${TUNNEL_MODE:=full}"
+: "${TUNNEL_RELAY_URLS:=}"
+: "${TUNNEL_TRANSPORT:=auto}"
+: "${DYNDNS_PROVIDER:=}"
+
 USE_HAPROXY=true
+USE_TUNNEL=false
 SHOW_HELP=false
 
 # ─── Parse one SSL/HAProxy CLI argument ───────────────────────────────────────
@@ -147,6 +155,11 @@ _ssl_parse_arg() {
         --haproxy-net)    require_arg "$1" "${2:-}"; HAPROXY_NET="$2";      return 2 ;;
         --haproxy-api-key) require_arg "$1" "${2:-}"; HAPROXY_API_KEY="$2"; return 2 ;;
         --no-haproxy)     USE_HAPROXY=false; HAPROXY_HOST=""; return 1 ;;
+        --remote-haproxy-id) require_arg "$1" "${2:-}"; REMOTE_HAPROXY_ID="$2"; USE_TUNNEL=true; return 2 ;;
+        --tunnel-mode)    require_arg "$1" "${2:-}"; TUNNEL_MODE="$2";      return 2 ;;
+        --tunnel-relay)   require_arg "$1" "${2:-}"; TUNNEL_RELAY_URLS="$2"; return 2 ;;
+        --tunnel-transport) require_arg "$1" "${2:-}"; TUNNEL_TRANSPORT="$2"; return 2 ;;
+        --dyndns-provider) require_arg "$1" "${2:-}"; DYNDNS_PROVIDER="$2"; return 2 ;;
         --container-name) require_arg "$1" "${2:-}"; CONTAINER_NAME="$2";   return 2 ;;
         --image)          require_arg "$1" "${2:-}"; IMAGE_NAME="$2";       return 2 ;;
         --help|-h)        SHOW_HELP=true; return 1 ;;
@@ -168,7 +181,15 @@ _ssl_env_args() {
         if [ -n "$SSL_STAGING" ]; then echo "-e SSL_STAGING=$SSL_STAGING"; fi
         if [ -n "$SSL_TEST_MODE" ]; then echo "-e SSL_TEST_MODE=$SSL_TEST_MODE"; fi
     fi
-    if [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; then
+    if [ "$USE_TUNNEL" = true ] && [ -n "$REMOTE_HAPROXY_ID" ]; then
+        echo "-e REMOTE_HAPROXY_ID=$REMOTE_HAPROXY_ID"
+        echo "-e TUNNEL_MODE=$TUNNEL_MODE"
+        if [ -n "$TUNNEL_RELAY_URLS" ]; then echo "-e TUNNEL_RELAY_URLS=$TUNNEL_RELAY_URLS"; fi
+        if [ -n "$TUNNEL_TRANSPORT" ]; then echo "-e TUNNEL_TRANSPORT=$TUNNEL_TRANSPORT"; fi
+        if [ -n "$DYNDNS_PROVIDER" ]; then echo "-e DYNDNS_PROVIDER=$DYNDNS_PROVIDER"; fi
+        if [ -n "$EXTRA_PORTS" ]; then echo "-e EXTRA_PORTS=$EXTRA_PORTS"; fi
+        if [ -n "$HAPROXY_API_KEY" ]; then echo "-e HAPROXY_API_KEY=$HAPROXY_API_KEY"; fi
+    elif [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; then
         echo "-e HAPROXY_HOST=$HAPROXY_HOST"
         echo "-e HAPROXY_API_PORT=$HAPROXY_API_PORT"
         if [ -n "$HAPROXY_API_KEY" ]; then echo "-e HAPROXY_API_KEY=$HAPROXY_API_KEY"; fi
@@ -178,6 +199,9 @@ _ssl_env_args() {
 
 # ─── Build port args ──────────────────────────────────────────────────────────
 _ssl_port_args() {
+    if [ "$USE_TUNNEL" = true ] && [ -n "$REMOTE_HAPROXY_ID" ]; then
+        return  # Traffic arrives through tunnel, no port publishing
+    fi
     if [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; then
         return  # HAProxy owns all ports
     fi
@@ -187,6 +211,10 @@ _ssl_port_args() {
 # ─── Setup Docker networks ───────────────────────────────────────────────────
 _ssl_setup_networks() {
     if [ -n "${APP_NET:-}" ]; then docker network inspect "$APP_NET" >/dev/null 2>&1 || docker network create "$APP_NET"; fi
+    # In tunnel mode, no haproxy-net needed (traffic goes through WireGuard)
+    if [ "$USE_TUNNEL" = true ] && [ -n "$REMOTE_HAPROXY_ID" ]; then
+        return
+    fi
     if [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; then
         docker network inspect "$HAPROXY_NET" >/dev/null 2>&1 || docker network create "$HAPROXY_NET"
     fi
@@ -205,12 +233,16 @@ _ssl_stop_existing() {
 _ssl_start_container() {
     local primary_net="${APP_NET:-default}"
     local secondary_net=""
-    if [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; then
+    if [ "$USE_TUNNEL" = true ] && [ -n "$REMOTE_HAPROXY_ID" ]; then
+        # Tunnel mode: no haproxy-net, just app-net
+        primary_net="${APP_NET:-default}"
+        secondary_net=""
+    elif [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; then
         primary_net="$HAPROXY_NET"
         secondary_net="${APP_NET:-}"
     fi
 
-    local all_env=() all_ports=() all_extra=() host_opts=()
+    local all_env=() all_ports=() all_extra=() host_opts=() tunnel_opts=()
 
     # Helper: read lines of "-flag value" or "-flag=value" and split into
     # separate array elements so docker receives them as distinct arguments.
@@ -246,11 +278,21 @@ _ssl_start_container() {
         [[ "${OSTYPE:-linux}" != "darwin"* ]] && host_opts=(--add-host=host.docker.internal:host-gateway)
     fi
 
+    # Tunnel mode: add CAP_NET_ADMIN and /dev/net/tun for WireGuard (full mode only)
+    if [ "$USE_TUNNEL" = true ] && [ -n "$REMOTE_HAPROXY_ID" ]; then
+        if [ "$TUNNEL_MODE" != "lite" ]; then
+            tunnel_opts+=(--cap-add=NET_ADMIN)
+            tunnel_opts+=(--device /dev/net/tun:/dev/net/tun)
+            tunnel_opts+=(--sysctl net.ipv4.conf.all.src_valid_mark=1)
+        fi
+    fi
+
     docker create \
         --name "$CONTAINER_NAME" \
         --restart on-failure:5 \
         --network "$primary_net" \
         "${host_opts[@]}" \
+        "${tunnel_opts[@]}" \
         -v "${DATA_VOLUME}:/data" \
         -v "${LETSENCRYPT_VOLUME}:/etc/letsencrypt" \
         "${all_ports[@]}" \
@@ -327,6 +369,13 @@ HAProxy Configuration:
   --haproxy-api-key <key>  Bearer token for Registration API
   --no-haproxy             Skip HAProxy, expose ports directly
 
+Remote Tunnel:
+  --remote-haproxy-id <npub>  Remote HAProxy daemon Nostr npub
+  --tunnel-mode <mode>        full (WireGuard VPN) or lite (SSH -R)
+  --tunnel-relay <urls>       Nostr relay URLs (comma-separated)
+  --tunnel-transport <type>   udp, wss, or auto (default)
+  --dyndns-provider <name>    DynDNS provider for self-managed DNS
+
 Container:
   --container-name <name>  Container name
   --image <image>          Docker image
@@ -386,7 +435,10 @@ ssl_manager_run() {
     [ -n "$SSL_DOMAIN" ] && echo "  SSL Domain: $SSL_DOMAIN" || echo "  SSL:        disabled"
     if [ -n "$SSL_DOMAIN_ALIASES" ]; then echo "  Aliases:    $SSL_DOMAIN_ALIASES"; fi
     [ -n "$SSL_DOMAIN" ] && [ -n "$SSL_ADMIN_EMAIL" ] && echo "  SSL Email:  $SSL_ADMIN_EMAIL"
-    if [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; then
+    if [ "$USE_TUNNEL" = true ] && [ -n "$REMOTE_HAPROXY_ID" ]; then
+        echo "  Tunnel:     ${REMOTE_HAPROXY_ID:0:20}... (${TUNNEL_MODE} mode)"
+        [ -n "$TUNNEL_TRANSPORT" ] && [ "$TUNNEL_TRANSPORT" != "auto" ] && echo "  Transport:  $TUNNEL_TRANSPORT"
+    elif [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; then
         echo "  HAProxy:    $HAPROXY_HOST (via $HAPROXY_NET)"
     else
         echo "  HAProxy:    disabled (direct ports)"

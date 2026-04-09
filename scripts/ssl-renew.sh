@@ -85,6 +85,42 @@ sleep 3600
 while true; do
     log "Checking certificate renewal..."
 
+    # Check tunnel health before renewal (if tunnel mode is active)
+    if [[ -f /tmp/.ssl-tunnel-env ]]; then
+        # shellcheck disable=SC1091
+        . /tmp/.ssl-tunnel-env
+        if [[ "${TUNNEL_ACTIVE:-}" == "true" ]] && [[ "${TUNNEL_TYPE:-}" == "wireguard" ]]; then
+            _wg_handshake=$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)
+            _now=$(date +%s)
+            if [[ -n "$_wg_handshake" ]] && [[ "$_wg_handshake" -gt 0 ]]; then
+                _handshake_age=$(( _now - _wg_handshake ))
+                if [[ "$_handshake_age" -gt 180 ]]; then
+                    warn "Tunnel handshake stale (${_handshake_age}s ago) — skipping renewal attempt"
+                    log "Next renewal check in ~12 hours"
+                    JITTER=$((RANDOM % 1800))
+                    sleep $((43200 + JITTER))
+                    continue
+                fi
+            fi
+        fi
+    fi
+
+    # Track consecutive certbot failures to avoid rate limit exhaustion
+    : "${_certbot_failures:=0}"
+    : "${_certbot_failure_day:=$(date +%j)}"
+    _today=$(date +%j)
+    if [[ "$_today" != "$_certbot_failure_day" ]]; then
+        _certbot_failures=0
+        _certbot_failure_day="$_today"
+    fi
+
+    if [[ "$_certbot_failures" -ge 2 ]]; then
+        warn "Skipping renewal: ${_certbot_failures} failures today (max 2 per 24h per domain)"
+        JITTER=$((RANDOM % 1800))
+        sleep $((43200 + JITTER))
+        continue
+    fi
+
     # Renew all managed certs (primary + aliases) without --cert-name
     if certbot renew \
         --webroot \
@@ -92,8 +128,11 @@ while true; do
         --deploy-hook "touch /tmp/.ssl-renewal-restart" \
         2>&1 | tee -a /var/log/certbot-renew.log; then
         log "Renewal check complete"
+        _certbot_failures=0
     else
         warn "Renewal check failed (certbot exited non-zero)"
+        _certbot_failures=$((_certbot_failures + 1))
+        warn "Consecutive failures today: ${_certbot_failures}/2"
     fi
 
     # Log current certificate expiry after each check

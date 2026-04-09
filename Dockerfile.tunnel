@@ -1,0 +1,85 @@
+# ssl-manager:tunnel — Base image with tunnel dependencies
+#
+# Extends the standard ssl-manager image with WireGuard, wstunnel,
+# Node.js, and Sphere SDK for remote HAProxy tunneling.
+#
+# Usage:
+#   FROM ghcr.io/unicitynetwork/ssl-manager:tunnel
+
+FROM debian:trixie-slim
+
+# Install base ssl-manager dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        certbot \
+        curl \
+        jq \
+        openssl \
+        netcat-openbsd \
+        python3 \
+        ca-certificates \
+        procps \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install tunnel-specific dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        wireguard-tools \
+        iproute2 \
+        iptables \
+        autossh \
+        openssh-client \
+        nodejs \
+        npm \
+        iputils-ping \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install wireguard-go (userspace fallback for kernels < 5.6)
+# Note: wireguard-go is fetched as a static binary if available,
+# otherwise built from source. For now, the kernel module is preferred.
+RUN which wireguard-go 2>/dev/null || true
+
+# SSL management scripts (same as base image)
+COPY scripts/ssl-setup.sh       /usr/local/bin/ssl-setup
+COPY scripts/ssl-renew.sh       /usr/local/bin/ssl-renew
+COPY scripts/haproxy-register.sh /usr/local/bin/haproxy-register
+COPY scripts/ssl-verify.sh      /usr/local/bin/ssl-verify
+COPY scripts/ssl-http-proxy.py  /usr/local/bin/ssl-http-proxy
+COPY scripts/ssl-alias-proxy.py /usr/local/bin/ssl-alias-proxy
+COPY scripts/ssl-alias-proxy-wrapper.sh /usr/local/bin/ssl-alias-proxy-wrapper
+
+RUN chmod +x /usr/local/bin/ssl-setup \
+             /usr/local/bin/ssl-renew \
+             /usr/local/bin/haproxy-register \
+             /usr/local/bin/ssl-verify \
+             /usr/local/bin/ssl-http-proxy \
+             /usr/local/bin/ssl-alias-proxy \
+             /usr/local/bin/ssl-alias-proxy-wrapper
+
+# Tunnel manager (Node.js client-side component)
+COPY tunnel-manager/ /usr/local/bin/tunnel-manager/
+RUN cd /usr/local/bin/tunnel-manager && npm install --production 2>/dev/null || true
+
+# Create wrapper script for tunnel-manager
+RUN printf '#!/bin/bash\nexec node /usr/local/bin/tunnel-manager/src/index.mjs "$@"\n' \
+    > /usr/local/bin/tunnel-manager-bin \
+    && chmod +x /usr/local/bin/tunnel-manager-bin \
+    && ln -sf /usr/local/bin/tunnel-manager-bin /usr/local/bin/tunnel-manager
+
+# ACME challenge webroot directory
+RUN mkdir -p /var/www/acme-challenge/.well-known/acme-challenge
+
+# WireGuard config directory
+RUN mkdir -p /etc/wireguard
+
+# Tunnel identity directory (will be inside letsencrypt volume)
+RUN mkdir -p /etc/letsencrypt/tunnel-identity && chmod 700 /etc/letsencrypt/tunnel-identity
+
+# Ports:
+#   80   — HTTP reverse proxy (ACME challenges + app forwarding)
+#   8444 — TLS alias proxy (alias domain termination)
+EXPOSE 80
+EXPOSE 8444
+
+# Let's Encrypt certificate storage + tunnel identity
+VOLUME ["/etc/letsencrypt"]

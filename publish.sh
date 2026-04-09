@@ -38,7 +38,7 @@ if [[ "${FULL_IMAGE}" == ghcr.io/* ]]; then
     fi
 fi
 
-# Build
+# Build base image
 echo "Building ${FULL_IMAGE}:${TAG}..."
 docker build -t "${FULL_IMAGE}:${TAG}" "${SCRIPT_DIR}"
 
@@ -50,28 +50,64 @@ fi
 # Also tag as ssl-manager:latest locally (for downstream builds)
 docker tag "${FULL_IMAGE}:${TAG}" "ssl-manager:latest"
 
-IMAGE_SIZE=$(docker images --format "{{.Size}}" "${FULL_IMAGE}:${TAG}")
+# Build tunnel variant
 echo ""
-echo "Build successful (${IMAGE_SIZE})"
+echo "Building ${FULL_IMAGE}:tunnel..."
+docker build -t "${FULL_IMAGE}:tunnel" -f "${SCRIPT_DIR}/Dockerfile.tunnel" "${SCRIPT_DIR}"
+
+# If a specific tag is given, also tag tunnel variant with it
+if [ "${TAG}" != "latest" ]; then
+    docker tag "${FULL_IMAGE}:tunnel" "${FULL_IMAGE}:tunnel-${TAG}"
+fi
+
+# Also tag as ssl-manager:tunnel locally
+docker tag "${FULL_IMAGE}:tunnel" "ssl-manager:tunnel"
+
+# Build tunnel daemon
+if [ -d "${SCRIPT_DIR}/tunnel-daemon" ]; then
+    echo ""
+    echo "Building haproxy-tunnel-daemon..."
+    docker build -t "${REGISTRY}/haproxy-tunnel-daemon:${TAG}" "${SCRIPT_DIR}/tunnel-daemon"
+    if [ "${TAG}" != "latest" ]; then
+        docker tag "${REGISTRY}/haproxy-tunnel-daemon:${TAG}" "${REGISTRY}/haproxy-tunnel-daemon:latest"
+    fi
+fi
+
+IMAGE_SIZE=$(docker images --format "{{.Size}}" "${FULL_IMAGE}:${TAG}")
+TUNNEL_SIZE=$(docker images --format "{{.Size}}" "${FULL_IMAGE}:tunnel" 2>/dev/null || echo "N/A")
+echo ""
+echo "Build successful"
+echo "  Base: ${IMAGE_SIZE}"
+echo "  Tunnel: ${TUNNEL_SIZE}"
 
 # Push
 echo ""
 echo "Tags to push:"
 echo "  ${FULL_IMAGE}:${TAG}"
 [ "${TAG}" != "latest" ] && echo "  ${FULL_IMAGE}:latest"
+echo "  ${FULL_IMAGE}:tunnel"
 echo ""
 read -p "Push to registry? [y/N] " -n 1 -r
 echo ""
 if [[ $REPLY =~ ^[Yy]$ ]]; then
     docker push "${FULL_IMAGE}:${TAG}"
     [ "${TAG}" != "latest" ] && docker push "${FULL_IMAGE}:latest"
+    docker push "${FULL_IMAGE}:tunnel"
+    [ "${TAG}" != "latest" ] && docker push "${FULL_IMAGE}:tunnel-${TAG}"
+    if docker images --format "{{.Repository}}:{{.Tag}}" | grep -q "haproxy-tunnel-daemon"; then
+        docker push "${REGISTRY}/haproxy-tunnel-daemon:${TAG}"
+        [ "${TAG}" != "latest" ] && docker push "${REGISTRY}/haproxy-tunnel-daemon:latest"
+    fi
     echo ""
-    echo "Pushed: ${FULL_IMAGE}:${TAG}"
+    echo "Pushed: ${FULL_IMAGE}:${TAG} and ${FULL_IMAGE}:tunnel"
     echo ""
     echo "Other projects can now use:"
-    echo "  FROM ${FULL_IMAGE}:${TAG}"
+    echo "  FROM ${FULL_IMAGE}:${TAG}       # without tunneling"
+    echo "  FROM ${FULL_IMAGE}:tunnel      # with tunneling"
 else
-    echo "Push cancelled. Image available locally as:"
+    echo "Push cancelled. Images available locally as:"
     echo "  ${FULL_IMAGE}:${TAG}"
+    echo "  ${FULL_IMAGE}:tunnel"
     echo "  ssl-manager:latest"
+    echo "  ssl-manager:tunnel"
 fi
