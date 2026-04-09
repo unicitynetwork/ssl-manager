@@ -231,9 +231,25 @@ PersistentKeepalive = 25
 
 **When to use:** Both WireGuard UDP (51820) and SSH are blocked, but HTTP/HTTPS traffic is allowed. Chisel tunnels through WebSocket on port 443, penetrating corporate firewalls. Note: Chisel provides per-port forwarding, not full VPN — outbound traffic from the container would NOT route through the tunnel. Only suitable when the container has independent internet access for DynDNS/certbot.
 
-### NOT RECOMMENDED: SSH -R (Reverse Port Forwarding)
+### LITE MODE: SSH -R + autossh (Inbound Only)
 
-SSH `-R` only forwards specific ports. It does NOT provide outbound routing. The container cannot make DynDNS API calls or certbot ACME requests through the tunnel. Would require bolting on SOCKS proxy, DNS forwarding, and per-service configuration — more complex than WireGuard.
+**When to use:** The container has **direct internet access** for outbound (certbot, DynDNS) but cannot receive inbound connections (home server behind NAT, residential ISP). This is the most common home-hosting scenario.
+
+SSH `-R` forwards specific ports from the HAProxy host to the container. It does NOT provide outbound routing — the container reaches the internet directly.
+
+**Advantages over WireGuard:**
+- **No CAP_NET_ADMIN** or `/dev/net/tun` required — works in unprivileged containers
+- **No kernel dependency** — works on any Linux, any Docker host
+- **~60KB** added to image (autossh) vs ~13MB (wireguard-tools + wstunnel)
+- **Works everywhere** — including Fargate, Cloud Run, ACI, and other serverless platforms
+- **Simpler debugging** — standard SSH tooling (ssh -v, netstat)
+
+**Limitations:**
+- Outbound traffic does NOT route through the tunnel (container uses its own internet)
+- Must explicitly forward each port (HTTP, HTTPS, extra ports)
+- Container's public IP ≠ HAProxy IP (DynDNS must point to HAProxy, but outbound appears from container's own IP)
+
+Select via `--tunnel-mode lite` or `TUNNEL_MODE=lite`. The DTNP negotiation is identical — the client includes `tunnel_preference: ["ssh-reverse"]` and the server responds with SSH credentials instead of WireGuard.
 
 ---
 
@@ -241,8 +257,9 @@ SSH `-R` only forwards specific ports. It does NOT provide outbound routing. The
 
 | Question | Answer | Choose |
 |----------|--------|--------|
-| Need full bidirectional network? | Yes | **WireGuard** |
-| Kernel supports WireGuard (5.6+)? | No | SSH tun (`ssh -w`) |
-| Only HTTP/443 allowed outbound? | Yes | Chisel (limited) |
+| Container has direct internet for outbound? | Yes | **Lite mode (SSH -R)** — simplest |
+| Container has NO internet (firewall blocks all)? | Yes | **Full mode (WireGuard)** |
+| Kernel supports WireGuard (5.6+)? | No | SSH tun (`ssh -w`) or Lite mode |
+| UDP blocked, only HTTPS allowed? | Yes | Full mode + WSS transport (wstunnel) |
+| Serverless platform (Fargate, Cloud Run)? | Yes | **Lite mode only** (no CAP_NET_ADMIN) |
 | Is anonymity critical? | Yes | Tor (accept latency) |
-| OK with vendor lock-in? | Yes | Cloudflare Tunnel |

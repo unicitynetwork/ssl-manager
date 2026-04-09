@@ -50,10 +50,15 @@ Every DTNP message is a JSON object with the following envelope:
 | `dtnp_version` | string | yes | Semver protocol version |
 | `msg_type` | string | yes | One of the defined message type constants |
 | `correlation_id` | string (UUID v4) | yes | Links requests to responses. The initial TUNNEL_REQUEST generates a fresh UUID; all subsequent messages in that tunnel session reuse the same correlation ID |
-| `sequence` | integer | yes | Monotonically increasing per sender per correlation session. Receivers MUST reject messages with a sequence number less than or equal to the last accepted sequence (replay prevention) |
-| `timestamp` | string (ISO-8601) | yes | UTC timestamp of message creation. Receivers MUST reject messages with a timestamp more than 5 minutes in the past or future |
+| `sequence` | uint64 | yes | Monotonically increasing per sender per correlation session. Resets to 0 on new correlation_id. For **heartbeat** messages: strict ordering — reject if sequence <= last accepted. For **state-transition** messages (REQUEST, OFFER, ACCEPT, ESTABLISHED, TEARDOWN): buffer out-of-order messages for up to 10 seconds before rejecting, to tolerate relay reordering (see Section 4.5) |
+| `timestamp` | string (ISO-8601) | yes | UTC timestamp of message creation. Receivers MUST reject messages with a timestamp more than 2 minutes in the past or future |
 | `sender_npub` | string | yes | Bech32 npub of the sending party. Receivers MUST verify this matches the NIP-17 decrypted sender key |
+| `relay_hints` | string[] | no | Nostr relay URLs the sender is monitoring. Receiver SHOULD publish responses to at least one of these relays |
 | `payload` | object | yes | Message-type-specific content (defined below) |
+
+### Event Deduplication
+
+Receivers MUST deduplicate by NIP-17 event ID. If the same NIP-17 event is received from multiple relays, only the first instance is processed. The receiver maintains a set of seen event IDs for the duration of the timestamp window (±2 minutes).
 
 ---
 
@@ -102,8 +107,10 @@ The `tunnel_preference` list is ordered from most preferred to least. WireGuard 
   "tunnel_type": "wireguard",
   "transports": [
     { "type": "udp",       "endpoint": "198.51.100.42:51820" },
-    { "type": "wss",       "endpoint": "wss://198.51.100.42:443/tunnel" },
-    { "type": "wss-proxy", "endpoint": "wss://198.51.100.42:443/tunnel", "proxy_compatible": true }
+    { "type": "wss",       "endpoint": "wss://tunnel.proxy.example.com:443/wg",
+                           "sni": "tunnel.proxy.example.com" },
+    { "type": "wss-proxy", "endpoint": "wss://tunnel.proxy.example.com:443/wg",
+                           "sni": "tunnel.proxy.example.com", "proxy_compatible": true }
   ],
   "auth": {
     "server_wg_pubkey": "base64-wireguard-pubkey",
@@ -129,7 +136,7 @@ The `tunnel_preference` list is ordered from most preferred to least. WireGuard 
     "bandwidth_limit_mbps": null,
     "max_connections": 1000,
     "tunnel_ttl_seconds": 86400,
-    "heartbeat_interval_seconds": 30,
+    "heartbeat_interval_seconds": 900,
     "heartbeat_missed_limit": 3
   },
   "server_version": "0.1.0"
@@ -138,10 +145,10 @@ The `tunnel_preference` list is ordered from most preferred to least. WireGuard 
 
 Key fields:
 
-- **`auth.preshared_key_enc`** — Encrypted to the client's npub using NIP-04. Single-use, generated per offer.
+- **`auth.preshared_key_enc`** — Encrypted to the client's npub using **NIP-44** (XChaCha20-Poly1305 AEAD). Single-use, generated per offer. NIP-04 is NOT used — it is deprecated and lacks authentication (no HMAC), making it susceptible to padding oracle attacks.
 - **`auth.allowed_ips: "0.0.0.0/0"`** — Routes ALL client traffic through the tunnel, giving the container full bidirectional connectivity through the HAProxy host's network.
 - **`haproxy_public_ip`** — The IP the client should use as its DNS A record value. The client updates its own DNS; the server never touches client DNS credentials.
-- **`haproxy_api`** — The HAProxy Registration API endpoint, reachable via the WireGuard tunnel IP (10.200.0.1). The `session_key` is a per-tunnel bearer token.
+- **`haproxy_api`** — The HAProxy Registration API endpoint, reachable via the WireGuard tunnel IP (10.200.0.1). The `session_key` is a per-tunnel bearer token **scoped to the domains in the original TUNNEL_REQUEST**. The HAProxy API MUST reject operations on domains outside the session key's scope. API calls per session key are rate-limited (10 calls per minute).
 - **`haproxy_backends`** — Pre-computed backend routing for primary domain + all aliases. The server uses the client's WireGuard peer IP directly, routing by domain name.
 - **`nat_masquerade: true`** — Confirms the server will NAT/masquerade client egress traffic so the container appears to originate from the HAProxy's public IP. This enables transparent DynDNS API calls, certbot ACME validation, and arbitrary outbound connections.
 
@@ -152,11 +159,13 @@ Key fields:
 ```json
 {
   "accepted_tunnel_type": "wireguard",
+  "accepted_transport": "wss",
   "ready_at": "2026-04-09T12:05:00Z"
 }
 ```
 
-The client's WireGuard public key was already provided in `TUNNEL_REQUEST.client_wg_pubkey`, so no additional auth material is needed in the accept message. This message confirms the client will use the offered tunnel parameters and is about to bring up its WireGuard interface.
+- **`accepted_transport`** — Which transport from the `transports` array the client will use (`"udp"`, `"wss"`, or `"wss-proxy"`). The server uses this to ensure the appropriate server-side infrastructure is active and to apply transport-specific constraints.
+- The client's WireGuard public key was already provided in `TUNNEL_REQUEST.client_wg_pubkey`, so no additional auth material is needed.
 
 ### 3.4 TUNNEL_ESTABLISHED (client → server)
 
@@ -185,11 +194,15 @@ This message is the client's confirmation that it has successfully brought up th
     "rtt_ms": 11
   },
   "cert_expiry_days": 28,
-  "next_heartbeat_in_seconds": 30
+  "next_heartbeat_in_seconds": 900
 }
 ```
 
-Either party may send TUNNEL_HEARTBEAT. If the server misses `heartbeat_missed_limit` consecutive heartbeats from the client, it MUST send TUNNEL_TEARDOWN with reason `TIMEOUT`. The client tracks server heartbeats and initiates RECONNECTING if the server side goes silent.
+**DM heartbeats are for status reporting, NOT liveness detection.** WireGuard's built-in `PersistentKeepalive` (25s) and the `wg show wg0 latest-handshake` command provide authoritative tunnel liveness signals without any relay traffic. DM heartbeats are sent every 15 minutes (configurable) for status updates and metrics.
+
+The server monitors tunnel liveness via WireGuard handshake timestamps directly (not via DM heartbeats). If a peer's handshake is stale for longer than `heartbeat_missed_limit * heartbeat_interval_seconds`, the server enters DRAINING state (see Section 4.2).
+
+**Metrics in heartbeats are optional.** Omitting them reduces metadata leakage on public relays. If privacy is a concern, send heartbeats with `metrics: null`.
 
 ### 3.6 TUNNEL_TEARDOWN (either direction)
 
@@ -217,7 +230,7 @@ Either party may send TUNNEL_HEARTBEAT. If the server misses `heartbeat_missed_l
 }
 ```
 
-Reason codes: `ERR_CAPACITY`, `ERR_ACL_DENIED`, `ERR_DOMAIN_CONFLICT`, `ERR_UNSUPPORTED_TUNNEL`, `ERR_VERSION_MISMATCH`, `ERR_INVALID_CREDENTIALS`, `ERR_RATE_LIMITED`, `ERR_DOMAIN_INVALID`.
+Reason codes: `ERR_CAPACITY`, `ERR_ACL_DENIED`, `ERR_DOMAIN_UNAUTHORIZED`, `ERR_DOMAIN_CONFLICT`, `ERR_UNSUPPORTED_TUNNEL`, `ERR_VERSION_MISMATCH`, `ERR_INVALID_CREDENTIALS`, `ERR_RATE_LIMITED`, `ERR_DOMAIN_INVALID`, `ERR_POOL_EXHAUSTED`.
 
 ### 3.8 TUNNEL_ERROR (either direction)
 
@@ -298,40 +311,66 @@ Reason codes: `ERR_CAPACITY`, `ERR_ACL_DENIED`, `ERR_DOMAIN_CONFLICT`, `ERR_UNSU
       └──────┘ send    └──────────────┘      └─────────────┘
                OFFER          │                     │
                          offer TTL                  │ TUNNEL_ESTABLISHED
-                         expired (60s)              │ received +
-                              │                     │ health verified
-                              v                     v
-                           [IDLE]           ┌──────────────────┐
-                                            │     ACTIVE       │◄─────────┐
-                                            └──────────────────┘          │
-                                                     │  │                 │
-                                        heartbeat    │  │ heartbeat       │
-                                        missed x3    │  │ exchange        │
-                                        or TEARDOWN  │  └─────────────────┘
-                                        received     │
-                                                     v
-                                             ┌──────────────┐
-                                             │ TEARING_DOWN │
+                         expired                    │ received + health verified
+                         (180s)                     │
+                              │                     │  timeout (180s, no
+                              v                     │  ESTABLISHED received)
+                           [IDLE]                   │         │
+                                                    v         v
+                                            ┌──────────┐  [TEARING_DOWN]
+                                            │  ACTIVE  │◄──────────┐
+                                            └──────────┘           │
+                                                 │  │              │
+                                    WG handshake │  │ heartbeat    │
+                                    stale >45min │  │ exchange     │
+                                    or TEARDOWN  │  └──────────────┘
+                                    received     │
+                                                 v
+                                         ┌──────────┐
+                                         │ DRAINING │ (120s grace period)
+                                         └──────────┘
+                                              │  │
+                              TUNNEL_REQUEST  │  │ grace period
+                              with known      │  │ expired
+                              correlation_id  │  │
+                                    │         │  │
+                                    v         │  v
+                            [fast-track      ┌──────────────┐
+                             re-negotiate]   │ TEARING_DOWN │
                                              └──────────────┘
-                                                     │
-                                        cleanup DNS + HAProxy
-                                        revoke credentials
-                                                     │
-                                                     v
-                                                  [IDLE]
+                                                    │
+                                       cleanup HAProxy + WG peer
+                                       revoke credentials
+                                       add to tombstone cache (5 min)
+                                                    │
+                                                    v
+                                                 [IDLE]
 ```
+
+**DRAINING state:** When the server detects tunnel degradation (WireGuard handshake stale beyond threshold), it enters DRAINING for 120 seconds before TEARING_DOWN. During DRAINING, if a TUNNEL_REQUEST arrives with the same correlation_id, the server fast-tracks re-negotiation (skips ACL re-validation, attempts to re-allocate the same peer IP). This accommodates brief outages where the client is reconnecting.
+
+**Tombstone cache:** After TEARING_DOWN completes, the server stores the `correlation_id` in a tombstone cache for 5 minutes. If a message (heartbeat, etc.) arrives for a tombstoned correlation_id, the server responds with TUNNEL_TEARDOWN (reason: `TIMEOUT`) so the client knows the session is dead. If a TUNNEL_REQUEST arrives with a tombstoned correlation_id, the server fast-tracks a new session.
+
+**At-most-one session per client:** The server enforces at most one active session per (client_npub, primary_domain) pair. A new TUNNEL_REQUEST for an existing pair tears down the old session first.
 
 ### 4.3 Timeout Reference
 
 | State | Party | Timeout | Action on Expiry |
 |-------|-------|---------|------------------|
 | REQUESTING | Client | 90 seconds | Retry TUNNEL_REQUEST (max 3), then give up |
-| OFFERED | Server | 60 seconds | Revoke offer, return to IDLE |
+| OFFERED | Server | 180 seconds | Revoke offer, free allocated resources, return to IDLE |
 | ACCEPTING | Client | 30 seconds | Retry TUNNEL_ACCEPT (max 2), then teardown |
-| ESTABLISHING | Client | 120 seconds | Send TUNNEL_ERROR (recoverable=false), teardown |
-| ACTIVE | Both | 3 x heartbeat interval | Initiate RECONNECTING (client) or TEARING_DOWN (server) |
+| ACCEPTING | **Server** | **180 seconds** | **Free allocated WG peer/iptables/backends, TEARING_DOWN** |
+| ESTABLISHING | Client | 120 seconds | Send TUNNEL_ERROR (recoverable=false) **immediately on wg-quick failure**, teardown |
+| ACTIVE | Client | WG handshake stale >3 min | Initiate RECONNECTING |
+| ACTIVE | Server | WG handshake stale >45 min | Enter DRAINING (120s grace) |
+| DRAINING | Server | 120 seconds | TEARING_DOWN |
 | RECONNECTING | Client | 300 seconds | Send TUNNEL_TEARDOWN, return to IDLE |
-| TEARING_DOWN | Both | 30 seconds | Force-close tunnel interface |
+| TEARING_DOWN | Both | 30 seconds | Force-close tunnel interface, add to tombstone cache |
+
+**Note:** Server ACTIVE timeout uses WireGuard handshake staleness (checked via `wg show wg0 latest-handshake`), NOT DM heartbeat misses. DM heartbeats are for status reporting only. The 45-minute server threshold is intentionally longer than the client's 3-minute threshold to give the client time to reconnect before the server tears down.
+
+**Note:** OFFERED timeout is 180 seconds (not 60) to accommodate Nostr relay latency. Both sides use the absolute `offer_expires_at` timestamp from TUNNEL_OFFER as the canonical expiry.
 
 ### 4.4 Retry Policy
 
@@ -343,6 +382,16 @@ All retries use truncated exponential backoff: wait `min(2^attempt * base_second
 | TUNNEL_ACCEPT | 5 | 30 | 2 |
 | DNS update | 15 | 120 | 4 |
 | Reconnection | 10 | 60 | 3 (then teardown) |
+
+### 4.5 Message Ordering and Relay Reordering
+
+Nostr relays do NOT guarantee message ordering. A message sent second may arrive first if delivered via a different relay.
+
+**State-transition messages** (TUNNEL_REQUEST, TUNNEL_OFFER, TUNNEL_ACCEPT, TUNNEL_ESTABLISHED, TUNNEL_TEARDOWN) are order-sensitive — processing them out of order can skip or break state transitions. Rule: if a state-transition message arrives with a sequence number higher than expected, the receiver MUST buffer it for up to **10 seconds** waiting for the missing message(s). If the gap is not filled within 10 seconds, process the buffered message and discard the missing one (it will be rejected if it arrives later due to sequence enforcement).
+
+**Heartbeat messages** are NOT order-sensitive. Strict sequence enforcement applies — out-of-order heartbeats are silently dropped. This is safe because heartbeats are periodic and losing one is tolerable.
+
+**Idempotency rule:** The server enforces at-most-one active session per `(client_npub, primary_domain)` pair. If a new TUNNEL_REQUEST arrives for a pair that already has a session in any non-IDLE state, the server tears down the old session first. The client MUST ignore TUNNEL_OFFERs whose correlation_id does not match its current pending request.
 
 ---
 
@@ -388,7 +437,9 @@ Client                          Nostr Relay                     Server (HAProxy)
   │                                  │                                │
   │──TUNNEL_HEARTBEAT───────────────►│──────────────────────────────►│
   │◄─────────────────────────────────│◄──TUNNEL_HEARTBEAT────────────│
-  │  (every 30s, bidirectional)      │                                │
+  │  (every 15min, status only)      │                                │
+  │  (WG keepalive every 25s for     │                                │
+  │   tunnel liveness — no DMs)      │                                │
 ```
 
 ### 5.3 Reconnection Scenario
@@ -396,21 +447,35 @@ Client                          Nostr Relay                     Server (HAProxy)
 ```
 Client                                                          Server
   │                                                               │
-  │  [SSH tunnel drops — network disruption]                      │
+  │  [WireGuard tunnel drops — network disruption]                │
   │                                                               │
-  │  [missed heartbeat 1]                                         │
-  │  [missed heartbeat 2]                                         │
-  │  [missed heartbeat 3]                                         │
-  │  [enter RECONNECTING]                                         │  [3 missed HBs → TEARING_DOWN]
+  │  [WG handshake stale >3min]                                   │
+  │  [enter RECONNECTING]                                         │
+  │  [add random jitter 0-60s]                                    │
+  │                                                               │  [WG handshake stale >45min]
+  │                                                               │  [enter DRAINING (120s grace)]
   │                                                               │
   │──TUNNEL_REQUEST (same correlation_id, same idempotency_key)──►│
-  │                                                               │ [correlation_id known,
-  │                                                               │  reuse session, issue new offer]
+  │                                                               │ [in DRAINING: fast-track,
+  │                                                               │  reuse peer IP, fresh credentials]
   │◄────────────────────────TUNNEL_OFFER (refreshed credentials)──│
   │                                                               │
   │──TUNNEL_ACCEPT────────────────────────────────────────────────►│
   │──TUNNEL_ESTABLISHED───────────────────────────────────────────►│
-  │                                                               │ [session → ACTIVE]
+  │                                                               │ [cancel DRAINING → ACTIVE]
+```
+
+**Brief outage recovery (no DM needed):**
+```
+Client                                                          Server
+  │                                                               │
+  │  [WG handshake stale 30s — brief network glitch]              │
+  │  [WireGuard auto-recovers via PersistentKeepalive]            │
+  │  [handshake refreshed]                                        │
+  │                                                               │
+  │──TUNNEL_HEARTBEAT (immediate, cancel any pending teardown)───►│
+  │                                                               │ [heartbeat received,
+  │                                                               │  cancel DRAINING if active]
 ```
 
 ### 5.4 Rejection and Graceful Teardown
@@ -443,17 +508,21 @@ Client                                                          Server
 
 Every message is NIP-17 gift-wrapped: the inner event is signed by the sender's secp256k1 key and encrypted to the recipient's key. The `sender_npub` field in the envelope MUST match the decrypted inner event's `pubkey`. Any mismatch MUST be treated as a forgery and silently dropped.
 
-The server maintains an allowlist of authorized client npubs. A TUNNEL_REQUEST from an unknown npub is rejected with `ERR_ACL_DENIED`. The allowlist entry may optionally constrain which domains and ports a given client may request.
+The server maintains a **domain-scoped ACL** of authorized client npubs. Each entry binds a client npub to specific domain patterns (e.g., `["mydomain.com", "*.mydomain.com"]`). Domain binding is **mandatory** — a client cannot request domains outside its authorized scope. A TUNNEL_REQUEST from an unknown npub is rejected with `ERR_ACL_DENIED`. A TUNNEL_REQUEST for a domain outside the client's scope is rejected with `ERR_DOMAIN_UNAUTHORIZED`.
 
 ### 6.2 Replay Prevention
 
-The combination of `correlation_id` + `sequence` prevents replay attacks within a session. The server maintains a per-correlation-id sequence counter and discards any message where `sequence <= last_seen_sequence`. The `timestamp` ±5-minute window prevents cross-session replays of old valid messages.
+Three layers of replay prevention:
 
-`idempotency_key` prevents duplicate tunnel creation if a TUNNEL_REQUEST is retransmitted after a delayed TUNNEL_OFFER. The server MUST store `idempotency_key → haproxy_backend_id` for the duration of the tunnel's configured TTL.
+1. **NIP-17 event ID deduplication:** Receivers deduplicate by NIP-17 event ID. Same event received from multiple relays is processed only once (see Section 2).
+2. **Session-scoped sequence numbers:** `correlation_id` + `sequence` prevents replay within a session (see Section 4.5 for ordering rules).
+3. **Timestamp window:** ±2-minute tolerance prevents cross-session replays of old messages.
+
+`idempotency_key` prevents duplicate tunnel creation if a TUNNEL_REQUEST is retransmitted after a delayed TUNNEL_OFFER. Scoped to `(client_npub, primary_domain)`: a new idempotency_key for the same pair supersedes any previous one. If the server receives a retried idempotency_key while in OFFERED state, it MUST revoke the old offer (invalidate old preshared key), generate fresh credentials, and send a new TUNNEL_OFFER.
 
 ### 6.3 Credential Handling
 
-Tunnel credentials (WireGuard preshared keys) are single-use and generated fresh per TUNNEL_OFFER. They are encrypted to the recipient's npub using NIP-04 before inclusion in the JSON payload, meaning they are doubly encrypted: once by NIP-04 for the credential blob, and again by NIP-17 for the message envelope.
+Tunnel credentials (WireGuard preshared keys) are single-use and generated fresh per TUNNEL_OFFER. They are encrypted to the recipient's npub using **NIP-44** (XChaCha20-Poly1305 AEAD) before inclusion in the JSON payload, providing authenticated inner encryption. The outer NIP-17 gift wrap provides a second encryption layer. NIP-04 is NOT used — it lacks authentication and is deprecated.
 
 The server MUST NOT log or persist credentials in plaintext. After tunnel teardown, the server MUST delete any credential material associated with the `correlation_id`.
 
@@ -484,6 +553,33 @@ For SSH-based tunnels, the client MUST verify the server's host key fingerprint 
 ### No DNS Messages in DTNP
 
 There are no `TUNNEL_DNS_REQUEST` or `TUNNEL_DNS_RESPONSE` message types. The protocol does not include DNS operations — they are handled entirely by the client through standard outbound internet connectivity provided by the tunnel.
+
+### 3.9 TUNNEL_CONFIG_UPDATE (server → client)
+
+```json
+{
+  "updated_fields": {
+    "haproxy_public_ip": "203.0.113.10"
+  },
+  "reason": "IP_CHANGE",
+  "message": "HAProxy public IP changed due to failover"
+}
+```
+
+Sent when the server's configuration changes in a way that affects the client (e.g., public IP change, port reallocation). The client MUST update its DNS records and acknowledge by sending a TUNNEL_HEARTBEAT with the updated config reflected. If the client does not acknowledge within 5 minutes, the server MAY send TUNNEL_TEARDOWN.
+
+### 3.10 TUNNEL_MAINTENANCE_NOTICE (server → client)
+
+```json
+{
+  "maintenance_at": "2026-04-10T02:00:00Z",
+  "expected_duration_seconds": 600,
+  "action": "TEARDOWN_AND_RECONNECT",
+  "message": "Scheduled WireGuard key rotation"
+}
+```
+
+Advance warning of planned server maintenance. The client can use this to drain connections and prepare for a brief outage. The server will send TUNNEL_TEARDOWN at or after `maintenance_at`. The client should reconnect automatically after the maintenance window.
 
 ---
 
@@ -517,14 +613,17 @@ A future extension could allow servers to forward TUNNEL_REQUEST to peer servers
 |------|-----------|---------|
 | `ERR_VERSION_MISMATCH` | S→C | Client version not supported |
 | `ERR_ACL_DENIED` | S→C | Client npub not on allowlist |
-| `ERR_DOMAIN_CONFLICT` | S→C | Domain already registered to another backend |
-| `ERR_DOMAIN_INVALID` | S→C | Domain fails format or policy validation |
+| `ERR_DOMAIN_UNAUTHORIZED` | S→C | Domain outside client's ACL-bound scope |
+| `ERR_DOMAIN_CONFLICT` | S→C | Domain already registered to another client |
+| `ERR_DOMAIN_INVALID` | S→C | Domain fails format or policy validation (blocklist, invalid FQDN) |
 | `ERR_CAPACITY` | S→C | Server at tunnel limit |
+| `ERR_POOL_EXHAUSTED` | S→C | WireGuard IP pool exhausted (all peer IPs allocated) |
 | `ERR_UNSUPPORTED_TUNNEL` | S→C | No common tunnel type found |
 | `ERR_RATE_LIMITED` | S→C | Too many requests from this client |
 | `ERR_INVALID_CREDENTIALS` | S→C | WireGuard credentials malformed or cannot be decrypted |
 | `ERR_TUNNEL_HEALTH_FAILED` | S→C | Health endpoint unreachable after ESTABLISHED |
 | `ERR_UNKNOWN_MESSAGE_TYPE` | Both | Unrecognized extension msg_type |
 | `ERR_SEQUENCE_REPLAY` | Both | Sequence number below expected |
-| `ERR_TIMESTAMP_SKEW` | Both | Timestamp outside ±5 minute window |
+| `ERR_TIMESTAMP_SKEW` | Both | Timestamp outside ±2 minute window |
 | `ERR_SIGNATURE_MISMATCH` | Both | sender_npub does not match NIP-17 inner pubkey |
+| `ERR_SESSION_CONFLICT` | S→C | Client already has an active session for this domain |
