@@ -2,70 +2,100 @@
 
 ## 1. High-Level Architecture
 
+The remote client container establishes a **full bidirectional VPN tunnel** (WireGuard) to the HAProxy host. The container operates as if it were on the HAProxy host's network — all outbound traffic (DynDNS API calls, certbot ACME validation, etc.) routes through the tunnel, and all inbound traffic (user requests, ACME challenges) arrives through it. The container sees the HAProxy host's public IP as its own egress.
+
 ```
-FIREWALL-CONSTRAINED CLIENT HOST                 PUBLIC REMOTE HOST
-┌──────────────────────────────────────────┐     ┌──────────────────────────────────────────────┐
-│  Docker Container (ssl-manager derived)  │     │  Remote HAProxy Host                         │
-│                                          │     │                                              │
-│  ┌──────────────────────────────────┐   │     │  ┌──────────────────────────────────────┐   │
-│  │  ssl-setup (orchestration)       │   │     │  │  haproxy-tunnel-daemon               │   │
-│  │  - Detects REMOTE_HAPROXY_ID     │   │     │  │  - Listens on Nostr relays           │   │
-│  │  - Delegates to tunnel-manager   │   │     │  │  - Handles DM negotiation            │   │
-│  └──────────┬───────────────────────┘   │     │  │  - Manages tunnel port pool          │   │
-│             │                           │     │  │  - Updates HAProxy config (runtime)  │   │
-│  ┌──────────▼───────────────────────┐   │     │  │  - Calls DynDNS API                  │   │
-│  │  tunnel-manager (new component)  │   │     │  └──────────────┬───────────────────────┘   │
-│  │  - DM negotiation via Sphere SDK │◄──┼─────┼─────────────────┘  (Nostr/NIP-17)          │
-│  │  - Establishes outbound tunnel   │   │     │                                              │
-│  │  - Monitors + reconnects         │   │     │  ┌──────────────────────────────────────┐   │
-│  │  - Signals ssl-setup on ready    │   │     │  │  HAProxy (runtime config)            │   │
-│  └──────────┬───────────────────────┘   │     │  │  - Frontend port 80 / 443            │   │
-│             │                           │     │  │  - Per-domain backend → tunnel port  │   │
-│  ┌──────────▼───────────────────────┐   │     │  └──────────────────────────────────────┘   │
-│  │  SSH / WireGuard tunnel          ├───┼────►│  tunnel-port-N (e.g., 127.0.0.1:21080)      │
-│  │  (outbound, client-initiated)    │   │     │  tunnel-port-M (e.g., 127.0.0.1:21443)      │
-│  └──────────┬───────────────────────┘   │     │                                              │
-│             │ loopback                  │     │  ┌──────────────────────────────────────┐   │
-│  ┌──────────▼───────────────────────┐   │     │  │  DynDNS integration                  │   │
-│  │  ssl-http-proxy (port 80)        │   │     │  │  (Cloudflare, Route53, RFC 2136)     │   │
-│  │  ssl-alias-proxy (port 8444)     │   │     │  └──────────────────────────────────────┘   │
-│  │  App (port SSL_HTTPS_PORT)       │   │     │                                              │
-│  └──────────────────────────────────┘   │     └──────────────────────────────────────────────┘
-│                                          │
-│  Nostr identity: client.npub             │                Internet
-│  /tmp/.ssl-tunnel-env                    │                    │
-└──────────────────────────────────────────┘      ┌─────────────────────┐
-                                                   │  DNS: mydomain.com  │
-                                                   │  → remote-haproxy-  │
-                                                   │    public-ip        │
-                                                   └─────────────────────┘
+FIREWALL-CONSTRAINED CLIENT HOST                    PUBLIC REMOTE HOST (HAProxy Container)
+┌────────────────────────────────────────────┐     ┌──────────────────────────────────────────────────┐
+│  Docker Container (ssl-manager derived)    │     │  HAProxy Docker Container                        │
+│                                            │     │                                                  │
+│  ┌────────────────────────────────────┐   │     │  ┌──────────────────────────────────────────┐   │
+│  │  ssl-setup (orchestration)         │   │     │  │  haproxy-tunnel-daemon (inside container) │   │
+│  │  - Detects REMOTE_HAPROXY_ID       │   │     │  │  - Node.js / Sphere SDK                  │   │
+│  │  - Delegates to tunnel-manager     │   │     │  │  - Listens for DMs via Sphere SDK         │   │
+│  └──────────┬─────────────────────────┘   │     │  │  - Handles DTNP negotiation               │   │
+│             │                             │     │  │  - Manages WireGuard peer configs          │   │
+│  ┌──────────▼─────────────────────────┐   │     │  │  - Updates HAProxy config (runtime API)   │   │
+│  │  tunnel-manager (new component)    │   │     │  │  - Proxies DynDNS traffic (transparent)   │   │
+│  │  - DM negotiation via Sphere SDK   │   │     │  └──────────────────┬───────────────────────┘   │
+│  │  - Establishes WireGuard tunnel    │◄──┼─────┼───────────────────┘  (Nostr/NIP-17 via         │
+│  │  - Monitors + reconnects           │   │     │                       Sphere SDK)               │
+│  │  - Signals ssl-setup on ready      │   │     │                                                  │
+│  └──────────┬─────────────────────────┘   │     │  ┌──────────────────────────────────────────┐   │
+│             │                             │     │  │  WireGuard (wg0 interface)                │   │
+│  ┌──────────▼─────────────────────────┐   │     │  │  - Server: 10.200.0.1/24                 │   │
+│  │  WireGuard VPN (wg0 interface)     │   │     │  │  - Peers: 10.200.0.2, .3, .4, ...        │   │
+│  │  - Client: 10.200.0.N/32           ├───┼────►│  │  - NAT masquerade for client egress       │   │
+│  │  - Default route via tunnel        │   │     │  │  - Port forwarding for inbound traffic    │   │
+│  │  - ALL traffic routed through wg0  │   │     │  └──────────────────────────────────────────┘   │
+│  └──────────┬─────────────────────────┘   │     │                                                  │
+│             │ (tunnel = full network)     │     │  ┌──────────────────────────────────────────┐   │
+│  ┌──────────▼─────────────────────────┐   │     │  │  HAProxy                                  │   │
+│  │  ssl-http-proxy (port 80)          │   │     │  │  - Frontend port 80 / 443                  │   │
+│  │  ssl-alias-proxy (port 8444)       │   │     │  │  - Per-domain backend → WG peer IP:port   │   │
+│  │  App (port SSL_HTTPS_PORT)         │   │     │  │  - Aliases: each gets own backend entry    │   │
+│  │                                    │   │     │  └──────────────────────────────────────────┘   │
+│  │  DynDNS client (direct outbound)   │   │     │                                                  │
+│  │  → routes via wg0 → HAProxy host   │   │     │  Public IP: 198.51.100.42                       │
+│  │  → HAProxy host NATs to internet   │   │     │  WireGuard listen: UDP 51820                     │
+│  │                                    │   │     │                                                  │
+│  │  certbot (direct outbound)         │   │     └──────────────────────────────────────────────────┘
+│  │  → routes via wg0 → HAProxy host   │   │
+│  │  → appears to originate from       │   │               Internet
+│  │    HAProxy's public IP             │   │                  │
+│  └────────────────────────────────────┘   │    ┌──────────────────────────┐
+│                                            │    │  DNS: mydomain.com       │
+│  Sphere SDK identity: client.npub          │    │  DNS: alias1.mydomain.com│
+│  /tmp/.ssl-tunnel-env                      │    │  DNS: alias2.mydomain.com│
+└────────────────────────────────────────────┘    │  → 198.51.100.42         │
+                                                   └──────────────────────────┘
 ```
 
-### Traffic Flow After Tunnel Establishment
+### Traffic Flows
 
+**Inbound (internet → container):**
 ```
 Internet user
-    │ HTTPS mydomain.com
+    │ HTTPS mydomain.com (or any alias)
     ▼
-Remote HAProxy (public IP, port 443)
-    │ SNI match → backend tunnel-port-M (127.0.0.1:21443)
+HAProxy (public IP, port 443)
+    │ SNI match → backend 10.200.0.N:${SSL_HTTPS_PORT}
     ▼
-SSH/WireGuard tunnel endpoint on remote host
-    │ forwarded through outbound tunnel
+WireGuard tunnel (wg0)
+    │ routed to client peer 10.200.0.N
     ▼
 Container port SSL_HTTPS_PORT (app TLS, unchanged)
-
-Internet user
-    │ HTTP mydomain.com (ACME challenge, nonce)
-    ▼
-Remote HAProxy (public IP, port 80)
-    │ Host match → backend tunnel-port-N (127.0.0.1:21080)
-    ▼
-SSH/WireGuard tunnel endpoint on remote host
-    │ forwarded through outbound tunnel
-    ▼
-Container port 80 (ssl-http-proxy, unchanged)
 ```
+
+**Outbound (container → internet, e.g., DynDNS API call):**
+```
+Container process (certbot, curl to DynDNS, etc.)
+    │ connects to external IP (e.g., api.cloudflare.com)
+    ▼
+wg0 interface (default route)
+    │ all traffic exits via WireGuard tunnel
+    ▼
+HAProxy host WireGuard server (10.200.0.1)
+    │ NAT masquerade (iptables MASQUERADE)
+    ▼
+Internet (appears to originate from HAProxy's public IP)
+```
+
+**Key insight:** Because all container traffic routes through the tunnel, the container behaves as if it is on the HAProxy host's network. DynDNS updates, certbot ACME challenges, health checks — everything works identically to the local HAProxy case. The container manages its own DNS credentials and calls its DynDNS provider directly; HAProxy merely provides transparent network connectivity.
+
+### Multiple Domain Aliases
+
+Each client can register a primary domain plus multiple aliases (`SSL_DOMAIN_ALIASES`). Because the tunnel is a full VPN (not per-port), all ports for all domains are accessible through a single WireGuard peer connection:
+
+```
+HAProxy backends for client 10.200.0.2:
+  ├─ mydomain.com          → 10.200.0.2:80  (HTTP)  / 10.200.0.2:443 (HTTPS SNI)
+  ├─ alias1.mydomain.com   → 10.200.0.2:8444 (alias proxy)
+  ├─ alias2.mydomain.com   → 10.200.0.2:8444 (alias proxy)
+  └─ extra TCP ports        → 10.200.0.2:50002, etc.
+```
+
+No per-alias port allocation needed on the HAProxy side — the WireGuard peer IP directly addresses the container, and HAProxy routes by domain to the appropriate container port.
 
 ---
 
@@ -75,79 +105,146 @@ Container port 80 (ssl-http-proxy, unchanged)
 
 #### `tunnel-manager` (in-container, `/usr/local/bin/tunnel-manager`)
 
-The core new component. A bash + Python hybrid script that orchestrates the entire remote tunneling lifecycle: Nostr identity bootstrap, DM-based negotiation with the remote HAProxy, tunnel process management, heartbeat, and reconnection. Communicates with ssl-setup via two Unix signals and a shared state file at `/tmp/.ssl-tunnel-env`. Stateless between restarts — all persistent state lives in the letsencrypt volume.
+Orchestrates the remote tunneling lifecycle. Uses **Sphere SDK** for DM-based negotiation with the remote HAProxy daemon — sends DTNP messages, receives responses, manages the conversation state machine. Establishes and monitors the WireGuard tunnel, handles reconnection, and signals ssl-setup on readiness via `/tmp/.ssl-tunnel-env`.
 
-#### `haproxy-tunnel-daemon` (remote host side, outside this image)
+**Runtime:** Node.js (Sphere SDK requires it). Sphere SDK is added to the base image when `REMOTE_HAPROXY_ID` is configured, or pre-installed in the base image as an optional dependency.
 
-A long-running process on the remote HAProxy host. Listens on Nostr relays for tunnel request DMs addressed to its npub. Manages a pool of available local ports, enforces ACLs, responds with tunnel credentials, applies HAProxy runtime API changes, triggers DynDNS updates, and sends heartbeat acknowledgements. This component is a peer system — ssl-manager defines the protocol it must implement, but the daemon itself runs outside the Docker image.
+**Why Sphere SDK, not a custom Nostr client:** Sphere SDK already implements NIP-17 gift-wrapped DMs, key management, relay connection pooling, and message delivery — all battle-tested. Reimplementing this in Python would duplicate effort, introduce bugs, and diverge from the Unicity ecosystem's standard communication layer.
 
-#### `nostr-dm-client` (in-container, `/usr/local/bin/nostr-dm-client`)
+#### `haproxy-tunnel-daemon` (inside HAProxy container)
 
-A thin Python script wrapping the NIP-17 gift-wrap DM protocol over raw WebSocket connections to Nostr relays. Exposes a simple CLI: `nostr-dm-client send <npub> <json-payload>` and `nostr-dm-client recv <timeout-secs>`. Used exclusively by `tunnel-manager`. Does not depend on the Sphere SDK daemon — it is a self-contained implementation using only Python's standard library plus the secp256k1 primitives already available via the `cryptography` package installed with certbot.
+Runs **inside the HAProxy Docker container** as a background process alongside HAProxy itself. Written in Node.js using Sphere SDK for DM communication. Responsibilities:
+
+- Listens for DTNP `TUNNEL_REQUEST` DMs addressed to its npub
+- Validates client npub against ACL
+- Allocates WireGuard peer IP from its subnet pool (10.200.0.0/24)
+- Generates WireGuard peer config and sends `TUNNEL_OFFER` via DM
+- Adds WireGuard peer to the server's `wg0` interface
+- Configures HAProxy backends via runtime API (pointing to client's WireGuard IP)
+- Configures iptables NAT/masquerade for client egress traffic
+- Handles heartbeat, reconnection, and teardown
+- On teardown: removes WireGuard peer, HAProxy backends, iptables rules
+
+**Why inside the HAProxy container:** The daemon needs direct access to HAProxy's runtime API (Unix socket), the WireGuard interface (`wg` CLI), and iptables. Running it alongside HAProxy avoids cross-container coordination, shared volume mounts, and network namespace complexity.
 
 #### `/tmp/.ssl-tunnel-env`
 
-Sourceable file written by `tunnel-manager` when a tunnel is established. Contains `TUNNEL_HTTP_PORT`, `TUNNEL_HTTPS_PORT` (the remote ports on the HAProxy host forwarded into the container), and `TUNNEL_TYPE`. Read by ssl-setup to know the tunnel is live before proceeding.
+Sourceable file written by `tunnel-manager` when the tunnel is established:
+```bash
+TUNNEL_ACTIVE=true
+TUNNEL_TYPE=wireguard
+TUNNEL_CLIENT_IP=10.200.0.2
+TUNNEL_SERVER_IP=10.200.0.1
+HAPROXY_HOST=10.200.0.1
+HAPROXY_API_PORT=8404
+HAPROXY_API_KEY=<per-session-token>
+HAPROXY_REMOTE_PUBLIC_IP=198.51.100.42
+```
 
-#### `/tmp/.ssl-tunnel.pid`
-
-PID file for the active tunnel process (autossh or wg-quick wrapper). Used by tunnel-manager for monitoring and graceful teardown.
+After sourcing this file, ssl-setup's HAProxy registration calls target `10.200.0.1:8404` (the HAProxy's WireGuard IP), which is reachable through the tunnel.
 
 ### Modified Components
 
 #### `ssl-setup.sh`
 
-Gains a new early branch: if `REMOTE_HAPROXY_ID` is set, delegate to `tunnel-manager --wait-ready` before proceeding with HAProxy registration. After `tunnel-manager` signals readiness, ssl-setup reads `/tmp/.ssl-tunnel-env` to discover the remote tunnel ports and constructs its HAProxy registration payload using the remote-side REST API URL (communicated by the daemon in the DM response). The nonce verification step works unchanged — traffic arrives through the tunnel transparently.
+Gains a new early branch: if `REMOTE_HAPROXY_ID` is set, delegate to `tunnel-manager --start --wait-ready` before proceeding. After tunnel-manager signals readiness, ssl-setup sources `/tmp/.ssl-tunnel-env` which overrides `HAPROXY_HOST` to point at the WireGuard server IP. All subsequent steps (HAProxy registration, nonce verification, certbot, TLS verification) work unchanged — the tunnel provides transparent bidirectional connectivity.
 
 #### `haproxy-register.sh`
 
-Gains a `--remote` flag. When tunneling, the HAProxy REST API endpoint is on the remote host, not a Docker-networked peer. The URL comes from `HAPROXY_REMOTE_API_URL` (written to `/tmp/.ssl-tunnel-env` by tunnel-manager). The payload gains two new optional fields: `tunnel_http_port` and `tunnel_https_port`, which the remote daemon uses to configure HAProxy backends pointing at the tunnel endpoints rather than container hostnames.
+Gains awareness of alias domains in the tunnel context. When registering via the tunnel, it includes all `SSL_DOMAIN_ALIASES` in the registration payload so HAProxy creates backends for each alias pointing to the client's WireGuard IP. The registration payload includes `tunnel_peer_ip` so HAProxy knows to route to the WireGuard address rather than a Docker network hostname.
 
 #### `ssl-renew.sh`
 
-Gains awareness of `REMOTE_HAPROXY_ID`. On renewal, after certbot succeeds, it sends a DM to the remote daemon via `nostr-dm-client` with message type `CERT_RENEWED`, so the daemon can reload HAProxy if it performs TLS termination (relevant only if a future mode adds remote TLS termination; in the current passthrough design, this is informational only). The restart marker `/tmp/.ssl-renewal-restart` continues to work as-is.
+No changes needed. certbot renewal works transparently through the tunnel — outbound ACME requests route via WireGuard, inbound challenge validation arrives through the tunnel. The restart marker `/tmp/.ssl-renewal-restart` continues to work as-is.
 
 #### `run-lib.sh`
 
-Gains `--remote-haproxy-id`, `--tunnel-type`, `--tunnel-relay`, `--remote-haproxy-api-url` argument parsing, corresponding `_ssl_env_args` output, and removes the HAProxy network connect step when `REMOTE_HAPROXY_ID` is set (no shared Docker network needed).
+Gains `--remote-haproxy-id <npub>` and `--tunnel-relay <url>` argument parsing. When `REMOTE_HAPROXY_ID` is set:
+- Suppresses `--haproxy-host` Docker network wiring (no haproxy-net)
+- Removes `-p 80:80` port publishing (traffic arrives through tunnel)
+- Adds `--cap-add=NET_ADMIN` to Docker create (required for WireGuard)
+- Adds `--sysctl net.ipv4.conf.all.src_valid_mark=1` for WireGuard routing
 
 ---
 
-## 3. Tunnel Lifecycle
+## 3. Why WireGuard as Primary (Not SSH)
+
+The critical requirement is **bidirectional full-network transparency**: the container must behave as if it's on the HAProxy host's network. This rules out SSH reverse port forwarding, which only forwards specific ports:
+
+| Requirement | SSH -R (port forward) | WireGuard (VPN) |
+|------------|----------------------|-----------------|
+| Inbound traffic to container ports | Yes (explicit -R per port) | Yes (all ports, automatic) |
+| Outbound from container to internet | No (separate SOCKS proxy needed) | Yes (default route via wg0) |
+| Container sees HAProxy's public IP | No | Yes (NAT masquerade) |
+| DynDNS API calls from container | Requires separate proxy | Works transparently |
+| certbot outbound to ACME servers | Works (direct internet) | Works (via tunnel) |
+| Adding new ports at runtime | Requires tunnel restart | Automatic (VPN covers all) |
+| Multiple aliases (no per-alias ports) | Needs port per alias | Single peer IP, HAProxy routes by domain |
+| Docker image size | ~60KB (autossh) | ~5MB (wireguard-tools) |
+| Kernel requirement | None | Linux 5.6+ (or userspace) |
+| Container capability | None | `NET_ADMIN` |
+
+**WireGuard is the clear choice** because the bidirectional requirement makes SSH port forwarding inadequate without bolting on additional proxying infrastructure (SOCKS, DNS forwarding, etc.), which would be more complex than WireGuard.
+
+**Fallback: SSH with tun device** — If WireGuard is unavailable (older kernels), SSH can create a full network tunnel via `-w` (tun device forwarding), though this is less performant and more complex to configure.
+
+---
+
+## 4. Tunnel Lifecycle
 
 ### Establishment
 
-The preferred tunnel protocol is **SSH remote port forwarding** using `autossh` for process supervision. The client generates a 4096-bit RSA keypair on first run, persisting it at `/etc/letsencrypt/tunnel-identity/id_rsa{,.pub}` so it survives container restarts. The remote daemon installs the public key in its `~/.ssh/authorized_keys` with a `command=""` restriction that permits only specific remote forwards to the allocated loopback ports.
+1. tunnel-manager loads or generates a Sphere SDK identity (secp256k1 keypair) and a WireGuard keypair. Both are persisted at `/etc/letsencrypt/tunnel-identity/` so they survive container restarts.
+2. tunnel-manager sends `TUNNEL_REQUEST` DM via Sphere SDK to `REMOTE_HAPROXY_ID`, including:
+   - Primary domain + all aliases
+   - Required ports (HTTP 80, HTTPS `SSL_HTTPS_PORT`, alias proxy 8444, extra ports)
+   - Client WireGuard public key
+   - Client capabilities
+3. haproxy-tunnel-daemon receives the request, validates ACL, allocates a WireGuard peer IP (e.g., 10.200.0.2/32), and responds with `TUNNEL_OFFER`:
+   - WireGuard endpoint (public IP:51820)
+   - Server WireGuard public key
+   - Allocated client IP
+   - Preshared key (encrypted to client's npub)
+   - HAProxy API URL (via WireGuard IP)
+4. tunnel-manager writes WireGuard config and brings up `wg0`:
+   ```ini
+   [Interface]
+   PrivateKey = <client-private-key>
+   Address = 10.200.0.2/32
 
-The SSH command issued by tunnel-manager:
-```
-autossh -M 0 \
-  -N \
-  -o ServerAliveInterval=30 \
-  -o ServerAliveCountMax=3 \
-  -o ExitOnForwardFailure=yes \
-  -i /etc/letsencrypt/tunnel-identity/id_rsa \
-  -R 127.0.0.1:${TUNNEL_HTTP_PORT}:localhost:80 \
-  -R 127.0.0.1:${TUNNEL_HTTPS_PORT}:localhost:${SSL_HTTPS_PORT} \
-  -p ${SSH_PORT} \
-  ${TUNNEL_USER}@${TUNNEL_HOST}
-```
-
-Extra TCP ports from `EXTRA_PORTS` are mapped with additional `-R` flags, with ports allocated by the daemon and communicated in the `TUNNEL_ACCEPTED` message.
-
-**WireGuard** is the alternative protocol for environments where SSH is filtered. The daemon generates a WireGuard server peer config and returns the client's `[Interface]` and `[Peer]` blocks in the `TUNNEL_ACCEPTED` message. tunnel-manager writes a `wg0.conf` and calls `wg-quick up`. WireGuard requires the container to run with `NET_ADMIN` capability (`--privileged` is not required if the capability is explicitly granted).
+   [Peer]
+   PublicKey = <server-public-key>
+   PresharedKey = <preshared-key>
+   Endpoint = 198.51.100.42:51820
+   AllowedIPs = 0.0.0.0/0    # route ALL traffic through tunnel
+   PersistentKeepalive = 25
+   ```
+5. tunnel-manager verifies connectivity: pings `10.200.0.1`, then `curl http://10.200.0.1:8404/v1/health`.
+6. tunnel-manager sends `TUNNEL_ESTABLISHED` DM.
+7. tunnel-manager writes `/tmp/.ssl-tunnel-env` and signals ssl-setup to proceed.
 
 ### Monitoring
 
-tunnel-manager runs a background loop that probes the tunnel every 30 seconds by attempting a TCP connection to the remote daemon's management socket (a separate internal port returned in `TUNNEL_ACCEPTED` as `health_check_port`). If three consecutive probes fail, the tunnel is considered broken and RECONNECTING is entered. The tunnel process's PID is also watched; if autossh exits, the transition is immediate.
+tunnel-manager runs a background loop:
+- Every 30 seconds: ping `10.200.0.1` via `wg0`
+- Every 5 minutes: send `TUNNEL_HEARTBEAT` DM via Sphere SDK
+- Monitor `wg show wg0 latest-handshake` — if stale (>3 minutes), consider tunnel degraded
+- If 3 consecutive ping failures: enter RECONNECTING
 
 ### Reconnection
 
-On reconnection, tunnel-manager first attempts to re-establish an SSH session to the same endpoint (the daemon keeps the port allocation alive for 15 minutes after the last heartbeat, to accommodate brief network interruptions). If the same endpoint is reachable within 90 seconds, no re-negotiation DM is sent. If not, a new `TUNNEL_REQUEST` is sent with the original `request_id` included in a `reconnect_for` field, allowing the daemon to prioritize and potentially reuse the same port allocation.
+1. Bring down `wg0`, bring it back up (WireGuard handles roaming automatically if the endpoint hasn't changed)
+2. If endpoint is reachable within 90 seconds, no re-negotiation needed — WireGuard reconnects
+3. If still unreachable after 90 seconds: send new `TUNNEL_REQUEST` DM with same idempotency key
+4. After `TUNNEL_RECONNECT_MAX` total failures: signal fatal error to ssl-setup
 
 ### Teardown
 
-When the container receives SIGTERM, the entrypoint's trap triggers `haproxy-register unregister` (existing behavior). For the tunnel mode, this also invokes `tunnel-manager teardown`, which sends `TUNNEL_TEARDOWN` and waits up to 10 seconds for a `TUNNEL_TEARDOWN_ACK` before proceeding to kill the autossh process. The 10-second wait is bounded to not delay graceful shutdown beyond Docker's stop timeout.
+On container SIGTERM:
+1. Send `TUNNEL_TEARDOWN` DM via Sphere SDK (cleanup_dns: false — client manages its own DNS)
+2. `wg-quick down wg0`
+3. Remove `/tmp/.ssl-tunnel-env`
+4. HAProxy daemon receives teardown → removes WireGuard peer, removes HAProxy backends
 
 ### State Machine
 
@@ -158,186 +255,215 @@ IDLE
   │ REMOTE_HAPROXY_ID set at startup
   ▼
 BOOTSTRAPPING
-  │ Load or generate secp256k1 identity + SSH keypair
-  │ Connect to Nostr relays
+  │ Load/generate Sphere SDK identity + WireGuard keypair
+  │ Connect to Nostr relays via Sphere SDK
   ▼
 NEGOTIATING
-  │ Send TUNNEL_REQUEST
-  │ Wait up to 60s for TUNNEL_ACCEPTED or TUNNEL_REJECTED
+  │ Send TUNNEL_REQUEST via Sphere SDK DM
+  │ Wait up to 60s for TUNNEL_OFFER or TUNNEL_REJECTED
   │ On REJECTED with retry_after: sleep, retry (max 3 attempts)
   │ On timeout: retry with backoff (30s, 60s, 120s)
   ▼
 ESTABLISHING
-  │ Launch autossh (SSH) or wg-quick (WireGuard)
-  │ Verify tunnel ports are reachable locally
+  │ Write wg0.conf from TUNNEL_OFFER
+  │ wg-quick up wg0
+  │ Verify connectivity (ping + HAProxy API health)
+  │ Send TUNNEL_ESTABLISHED DM
   │ Write /tmp/.ssl-tunnel-env
-  │ Signal ssl-setup (SIGUSR1 = ready)
   ▼
 ACTIVE
-  │ Send HEARTBEAT every 5 minutes
-  │ Monitor tunnel process (SIGCHLD, port probing)
+  │ Send HEARTBEAT every 5 minutes via Sphere SDK DM
+  │ Monitor WireGuard handshake + ping
   ▼
-RECONNECTING (on tunnel process death or port probe failure)
-  │ Kill old tunnel process
-  │ Attempt to re-establish tunnel to same endpoint
-  │ If endpoint unreachable after 3 attempts: re-negotiate via DM
-  │ If re-negotiation fails: signal ssl-setup (SIGUSR2 = fatal)
+RECONNECTING (on ping failure or stale handshake)
+  │ wg-quick down/up wg0
+  │ If endpoint unreachable after 90s: re-negotiate via DM
+  │ If re-negotiation fails: signal ssl-setup (exit 16)
   ▼
 TEARING_DOWN (on SIGTERM from container shutdown)
-  │ Send TUNNEL_TEARDOWN DM
-  │ Kill tunnel process
+  │ Send TUNNEL_TEARDOWN DM via Sphere SDK
+  │ wg-quick down wg0
   │ Remove /tmp/.ssl-tunnel-env
   └► IDLE
 ```
 
 ---
 
-## 4. Dynamic DNS Integration
+## 5. Dynamic DNS Integration
 
-The DNS record problem is the critical path item: the container's domain must point to the remote HAProxy's public IP before certbot can perform HTTP-01 challenge validation.
+### Principle: Client Owns Its DNS
 
-### Ownership Model
+**HAProxy MUST NOT manage client DNS credentials.** The client is responsible for its own DynDNS updates. The tunnel provides transparent network connectivity so the client can reach its DNS provider directly.
 
-The remote HAProxy daemon owns and manages the DNS record for the client's domain. This is an intentional centralization: the daemon knows its own public IP definitively, can update DNS before responding to `TUNNEL_REQUEST`, and the client does not need DNS provider credentials.
+### How It Works
 
-The daemon communicates its DNS action in `TUNNEL_ACCEPTED.dns_action`:
+1. The client container has its DynDNS credentials (env vars, config files — same as without tunneling).
+2. The WireGuard tunnel routes all outbound traffic through the HAProxy host with NAT masquerade.
+3. When the client calls its DynDNS provider API (e.g., `curl https://api.cloudflare.com/...`), the request exits through the HAProxy host's public IP — transparently.
+4. The client updates its DNS A record to point to the HAProxy host's public IP (provided in `TUNNEL_OFFER.haproxy_public_ip`).
+5. DNS propagation happens normally.
 
-- **`managed`** — the daemon has updated (or will update within 30 seconds) the DNS A record for the domain to point to its own public IP. The client should wait for DNS propagation before proceeding. tunnel-manager polls `dig +short ${SSL_DOMAIN}` until it matches `dns_target`.
-- **`pre-configured`** — the domain already points to the remote HAProxy (manually configured by the operator). No DNS action needed.
-- **`client-managed`** — the daemon cannot manage DNS; the client must update DNS externally. In this case, `TUNNEL_ACCEPTED` still includes `dns_target` so the operator knows what IP to use. ssl-setup will proceed but may fail at nonce verification if DNS is not yet updated.
+### What HAProxy Provides
 
-### DNS Provider Integration (daemon side)
+The `TUNNEL_OFFER` message includes `haproxy_public_ip` — the IP address the client should use as the DNS A record value. The client uses this value when calling its DynDNS provider. HAProxy does not proxy, intercept, or see the DNS API credentials — it just provides NAT connectivity.
 
-The daemon supports a pluggable DNS backend:
+### DNS Flow Sequence
 
-- **Cloudflare API** — via `CF_API_TOKEN` and `CF_ZONE_ID` on the daemon host
-- **Route53** — via IAM role or explicit credentials
-- **RFC 2136 Dynamic DNS** — nsupdate with TSIG key, for self-hosted authoritative DNS
-- **Webhook** — arbitrary HTTP POST to a URL configured on the daemon, for custom DNS providers
+```
+1. Client receives TUNNEL_OFFER with haproxy_public_ip=198.51.100.42
+2. Client calls DynDNS API (via WireGuard → NAT → internet):
+     curl -H "Authorization: Bearer ${CF_TOKEN}" \
+       https://api.cloudflare.com/client/v4/zones/${ZONE}/dns_records \
+       -d '{"type":"A","name":"mydomain.com","content":"198.51.100.42"}'
+3. DNS propagates: mydomain.com → 198.51.100.42
+4. ssl-setup proceeds with nonce verification (unchanged)
+5. certbot obtains certificate (unchanged — HTTP-01 via tunnel)
+```
 
-DNS TTL is set to 60 seconds on records managed by the daemon. On teardown, the daemon removes the A record or restores a configurable default (e.g., a maintenance page IP).
+For multiple aliases, the client repeats the DNS update for each alias domain — all pointing to the same HAProxy public IP.
 
-### Alternative: Client-Provided DNS Credentials
+### Pre-Configured DNS
 
-For cases where the daemon operator does not want to manage DNS for client domains, the DTNP protocol (see `protocol-spec.md`) supports passing encrypted DNS credentials from the client to the server in the `TUNNEL_REQUEST.dns_request.credentials_enc` field. The credentials are NIP-04 encrypted to the server's npub, giving the server temporary access to update DNS on the client's behalf. This approach is more complex but supports arbitrary DNS providers without requiring the daemon operator to configure zone access.
-
-### Propagation Wait
-
-tunnel-manager polls DNS resolution up to 120 seconds after receiving `TUNNEL_ACCEPTED` with `dns_action: managed`. It uses `dig @8.8.8.8 +short ${SSL_DOMAIN}` to bypass local resolver cache. Once the IP matches `dns_target`, it signals ssl-setup to proceed. If DNS has not propagated within 120 seconds, tunnel-manager logs a warning and proceeds anyway — ssl-setup will fail at nonce verification (exit code 10) if the record is wrong, and the existing retry logic provides a recovery window.
-
----
-
-## 5. SSL Certificate Flow Through Tunnel
-
-The certificate acquisition flow is structurally identical to the local mode because the tunnel makes the container's port 80 accessible on the public internet via the remote HAProxy. From certbot's perspective, nothing has changed.
-
-**Detailed sequence:**
-
-1. tunnel-manager establishes SSH tunnel: remote `127.0.0.1:21080` → container `localhost:80`.
-2. Remote daemon configures HAProxy: `frontend http-in` routes `Host: mydomain.com` → `backend tunnel-mydomain-http` → `server s1 127.0.0.1:21080`.
-3. dns_action completes: `mydomain.com` A record → remote HAProxy public IP.
-4. ssl-setup proceeds normally: starts ssl-http-proxy on port 80, runs nonce verification (HTTP GET through HAProxy → tunnel → ssl-http-proxy).
-5. certbot runs webroot mode: places challenge file in `/var/www/acme-challenge/`. Let's Encrypt validates via `http://mydomain.com/.well-known/acme-challenge/...` → remote HAProxy → tunnel → container ssl-http-proxy → webroot file. No changes to certbot invocation.
-6. Certificate obtained. ssl-setup re-registers with HAProxy REST API (now at remote URL) with `https_port` set.
-7. Remote daemon updates HAProxy: `frontend https-in` routes SNI `mydomain.com` → `backend tunnel-mydomain-https` → `server s1 127.0.0.1:21443`.
-8. App TLS traffic flows: client → HAProxy port 443 → tunnel → container `SSL_HTTPS_PORT`. TLS is terminated by the app, not HAProxy (passthrough mode unchanged).
-
-**Renewal** works identically. ssl-renew calls `certbot renew --webroot` every ~12 hours. The tunnel is long-lived and remains established for the container's lifetime. No special renewal path exists for remote mode — the tunnel simply keeps port 80 connected.
+If the client's domain already points to the HAProxy's public IP (manually configured, or via a previous tunnel session), no DNS update is needed. The client can skip the DynDNS step entirely.
 
 ---
 
-## 6. Security Model
+## 6. SSL Certificate Flow Through Tunnel
+
+The certificate flow is **identical to local mode** because the WireGuard tunnel provides full bidirectional connectivity. From certbot's and ssl-setup's perspective, nothing has changed:
+
+1. WireGuard tunnel established: container has IP 10.200.0.2, default route via wg0.
+2. HAProxy configured: `mydomain.com` HTTP → 10.200.0.2:80, HTTPS SNI → 10.200.0.2:${SSL_HTTPS_PORT}.
+3. For each alias: HAProxy routes alias HTTP → 10.200.0.2:80, alias HTTPS → 10.200.0.2:8444.
+4. DNS points all domains to HAProxy public IP.
+5. ssl-setup starts ssl-http-proxy on port 80 (unchanged).
+6. Nonce verification: ssl-setup POSTs nonce to localhost:80, GETs via public domain. The GET arrives through: internet → HAProxy → WireGuard → container:80. Works transparently.
+7. certbot runs webroot on port 80: Let's Encrypt validates `http://mydomain.com/.well-known/acme-challenge/...` → HAProxy → WireGuard → container ssl-http-proxy → webroot. **certbot's outbound HTTPS to ACME servers also routes via WireGuard → NAT → internet.** No special configuration needed.
+8. Certificate obtained. Re-register with HAProxy including HTTPS port.
+9. For aliases: certbot obtains each alias cert, ssl-alias-proxy handles TLS termination.
+10. ssl-renew runs normally — renewal traffic routes through tunnel transparently.
+
+---
+
+## 7. Security Model
 
 ### Identity and Authentication
 
-Each party — client container and remote daemon — has a secp256k1 keypair (Nostr identity). DMs are NIP-17 gift-wrapped: encrypted to the recipient's pubkey, padded, and wrapped in an ephemeral event. An attacker who intercepts relay traffic cannot read message content.
-
-The client authenticates to the daemon by signing the `TUNNEL_REQUEST` event with its private key. The daemon evaluates the client's npub against an ACL configured on the daemon host. The ACL can be an allowlist of npubs, or a delegated trust model where any client presenting a valid NIP-26 delegation from a trusted root key is accepted.
+Both sides use **Sphere SDK identities** (secp256k1 keypairs). All DM communication is NIP-17 gift-wrapped: encrypted to the recipient's pubkey, signed by the sender's key. The haproxy-tunnel-daemon maintains an ACL of authorized client npubs.
 
 ### Tunnel Security
 
-SSH tunnels use public-key authentication only. The generated client SSH key is restricted on the server side via `authorized_keys` `command=""` and `permitopen` directives, limiting the key to forwarding only the specific ports allocated for that session. The daemon's `sshd` configuration must set `AllowTcpForwarding remote` and disable everything else for tunnel users.
+WireGuard provides:
+- **Mutual authentication** via public key exchange (negotiated through encrypted DMs)
+- **Perfect forward secrecy** via Noise protocol handshake
+- **Minimal attack surface** (~4,000 lines of kernel code, formally verified)
+- **Preshared key** (optional, generated per-session) for post-quantum resistance
+- **No listening port on client** — client initiates; only the server listens on UDP 51820
 
-Per-session HAProxy API keys are 32-byte random hex tokens, generated by the daemon and valid only for the lifetime of the session. They are transmitted only in the encrypted DM channel, never in plaintext.
+### Network Isolation
 
-### Threat Model Considerations
+Each client peer gets a unique `/32` IP within the 10.200.0.0/24 subnet. WireGuard's cryptokey routing ensures a client can only send traffic from its assigned IP. The HAProxy host's iptables rules:
+- MASQUERADE outbound traffic from 10.200.0.0/24 (client egress)
+- FORWARD traffic between HAProxy and WireGuard peers
+- No inter-peer traffic (clients cannot reach each other)
 
-**Relay compromise:** If a Nostr relay is compromised, an attacker can observe encrypted event metadata (sender npub, recipient npub, timestamp) but cannot read message content (NIP-17 encryption). An attacker cannot forge messages because they do not have the client's or daemon's private key.
+### Credential Separation
 
-**Port squatting on remote host:** The daemon must validate that tunnel remote-forward requests target only the pre-allocated loopback ports. The `authorized_keys` `permitopen` restriction enforces this at the SSH protocol level.
+- **DynDNS credentials:** Stay on the client. HAProxy never sees them. Client calls its DNS provider directly via the tunnel.
+- **WireGuard keys:** Client private key never leaves the client. Server private key never leaves the server. Only public keys are exchanged via encrypted DMs.
+- **HAProxy API key:** Per-session token generated by daemon, transmitted via encrypted DM, valid only for the tunnel session lifetime.
+- **Sphere SDK identity:** Per-container identity persisted in letsencrypt volume. Never transmitted — only used for signing/encryption locally.
 
-**Domain hijacking:** A malicious client could request a tunnel for a domain it does not own, causing the daemon to update DNS. The daemon mitigates this by requiring domain-control verification: generating a challenge value that the client must serve at a known path, or using a TXT record challenge.
+### Threat Model
 
-**DM replay:** Each `TUNNEL_REQUEST` includes a `timestamp` and `request_id`. The daemon rejects requests with timestamps older than 5 minutes or previously-seen `request_id` values (maintained in a small in-memory ring buffer).
+**Relay compromise:** Attacker sees encrypted event metadata but cannot read content (NIP-17). Cannot forge messages without private keys.
+
+**WireGuard port scan:** UDP 51820 is open on HAProxy host, but WireGuard silently drops packets from unknown peers (no response = no fingerprinting). Only peers with valid public keys can initiate a handshake.
+
+**Client impersonation:** Requires both the client's Sphere SDK private key (for DM authentication) and WireGuard private key (for tunnel authentication). Compromise of either alone is insufficient.
+
+**DM replay:** Prevented by correlation_id + sequence numbers + timestamp window (see protocol-spec.md).
 
 ---
 
-## 7. Configuration
+## 8. Configuration
 
 ### New Environment Variables (in-container)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `REMOTE_HAPROXY_ID` | _(empty)_ | Remote daemon's Nostr npub. Enables remote tunnel mode when set. |
-| `TUNNEL_TYPE` | `ssh-remote-forward` | Preferred tunnel protocol. `ssh-remote-forward` or `wireguard`. |
-| `TUNNEL_RELAY_URLS` | `wss://relay.primal.net,wss://relay.damus.io` | Comma-separated Nostr relay WebSocket URLs. |
-| `TUNNEL_IDENTITY_DIR` | `/etc/letsencrypt/tunnel-identity` | Directory for persisted Nostr and SSH keypairs. Stored in letsencrypt volume. |
-| `TUNNEL_NEGOTIATE_TIMEOUT` | `60` | Seconds to wait for `TUNNEL_ACCEPTED` before timeout and retry. |
-| `TUNNEL_HEARTBEAT_INTERVAL` | `300` | Seconds between `TUNNEL_HEARTBEAT` messages. |
+| `TUNNEL_RELAY_URLS` | `wss://relay.primal.net,wss://relay.damus.io` | Comma-separated Nostr relay WebSocket URLs for Sphere SDK. |
+| `TUNNEL_IDENTITY_DIR` | `/etc/letsencrypt/tunnel-identity` | Directory for persisted Sphere SDK and WireGuard keypairs. |
+| `TUNNEL_NEGOTIATE_TIMEOUT` | `60` | Seconds to wait for `TUNNEL_OFFER` before timeout and retry. |
+| `TUNNEL_HEARTBEAT_INTERVAL` | `300` | Seconds between `TUNNEL_HEARTBEAT` DMs. |
 | `TUNNEL_RECONNECT_MAX` | `10` | Maximum reconnection attempts before fatal exit. |
-| `DNS_PROPAGATION_TIMEOUT` | `120` | Seconds to wait for DNS to propagate after `dns_action: managed`. |
-| `TUNNEL_SSH_PORT` | `22` | SSH port on remote tunnel endpoint (may differ from standard). |
-| `REMOTE_HAPROXY_API_URL` | _(from DM)_ | Overrides the HAProxy API URL received in `TUNNEL_ACCEPTED`. Useful for testing. |
+| `DYNDNS_PROVIDER` | _(empty)_ | Client's DynDNS provider (e.g., `cloudflare`, `route53`). Client manages its own DNS. |
+| `DYNDNS_CREDENTIALS` | _(empty)_ | Client's DynDNS API credentials (provider-specific). Never sent to HAProxy. |
 
 ### New CLI Flags (`run-lib.sh`)
 
 | Flag | Env Var Set | Description |
 |------|-------------|-------------|
-| `--remote-haproxy-id <npub>` | `REMOTE_HAPROXY_ID` | Enable remote tunnel mode targeting this daemon. |
-| `--tunnel-type <type>` | `TUNNEL_TYPE` | Tunnel protocol preference. |
+| `--remote-haproxy-id <npub>` | `REMOTE_HAPROXY_ID` | Enable remote tunnel mode targeting this HAProxy daemon. |
 | `--tunnel-relay <url>` | `TUNNEL_RELAY_URLS` | Override Nostr relay URLs (comma-separated). |
-| `--tunnel-ssh-port <port>` | `TUNNEL_SSH_PORT` | SSH port for tunnel endpoint. |
-| `--dns-propagation-timeout <secs>` | `DNS_PROPAGATION_TIMEOUT` | DNS wait timeout override. |
+| `--dyndns-provider <name>` | `DYNDNS_PROVIDER` | Client's DynDNS provider for self-managed DNS. |
 
-When `--remote-haproxy-id` is set, `run-lib.sh` automatically suppresses `--haproxy-host` Docker network wiring (no haproxy-net connect) and removes `-p 80:80` port publishing (not needed; traffic arrives through the tunnel).
+When `--remote-haproxy-id` is set, `run-lib.sh` automatically:
+- Suppresses `--haproxy-host` Docker network wiring (no haproxy-net)
+- Removes `-p 80:80` port publishing (traffic arrives through tunnel)
+- Adds `--cap-add=NET_ADMIN` (required for WireGuard)
+- Adds `--sysctl net.ipv4.conf.all.src_valid_mark=1` (WireGuard routing)
+
+### HAProxy Daemon Configuration (haproxy-tunnel-daemon)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TUNNEL_DAEMON_NPUB` | _(required)_ | Daemon's Nostr npub (its Sphere SDK identity). |
+| `TUNNEL_DAEMON_NSEC` | _(required)_ | Daemon's Nostr nsec (private key). |
+| `TUNNEL_SUBNET` | `10.200.0.0/24` | WireGuard subnet for tunnel peers. |
+| `TUNNEL_WG_PORT` | `51820` | WireGuard listen port (UDP). |
+| `TUNNEL_ACL` | _(empty)_ | Comma-separated list of authorized client npubs. |
+| `TUNNEL_PUBLIC_IP` | _(auto-detected)_ | HAProxy host's public IP (for DNS instructions). |
+| `TUNNEL_MAX_PEERS` | `250` | Maximum simultaneous tunnel clients. |
 
 ### New Dockerfile Dependencies
 
-`autossh` is added to the base image's `apt-get install` list. WireGuard (`wireguard-tools`) is available as an optional install, documented as requiring the host kernel's WireGuard module and `NET_ADMIN` capability. The `cryptography` Python package (already a certbot dependency) provides secp256k1 primitives for nostr-dm-client.
+- `wireguard-tools` — WireGuard CLI (`wg`, `wg-quick`). ~5MB.
+- `node` + `sphere-sdk` — For Sphere SDK DM communication. Installed in base image or as optional layer.
+- `iptables` — For NAT masquerade (usually already present in Debian).
 
 ---
 
-## 8. Error Handling and Failure Modes
+## 9. Error Handling and Failure Modes
 
 ### New Exit Codes for ssl-setup
 
 | Code | Meaning |
 |------|---------|
 | `15` | Tunnel negotiation failed (daemon rejected or timeout after all retries) |
-| `16` | Tunnel establishment failed (SSH/WireGuard process failed to start) |
-| `17` | DNS propagation timeout (tunnel live but domain not resolving to remote HAProxy) |
+| `16` | Tunnel establishment failed (WireGuard interface failed to come up) |
+| `17` | DNS propagation timeout (tunnel live but domain not resolving to HAProxy IP) |
 
 ### Failure Scenarios
 
-**Nostr relay unavailable at startup:** tunnel-manager retries connecting to relays with exponential backoff (2s, 4s, 8s, cap 60s). It tries all configured relays in round-robin. After 5 minutes total, exits with code 15.
+**Nostr relay unavailable at startup:** tunnel-manager (via Sphere SDK) retries relay connections with backoff. Sphere SDK handles relay failover to configured alternates. After 5 minutes total, exits with code 15.
 
-**Daemon offline or not responding:** `TUNNEL_REQUEST` times out after `TUNNEL_NEGOTIATE_TIMEOUT`. Retried up to 3 times with 30-second gaps. If all fail, ssl-setup exits 15. The operator should verify the daemon is running and the npub is correct.
+**Daemon offline or not responding:** `TUNNEL_REQUEST` DM times out after `TUNNEL_NEGOTIATE_TIMEOUT`. Retried up to 3 times with exponential backoff. If all fail, ssl-setup exits 15.
 
-**SSH key rejected by daemon:** The daemon sends `TUNNEL_REJECTED` with `reason: acl_denied`. tunnel-manager logs the rejection, does not retry (retrying would not help), and exits 15. The operator must add the client's npub to the daemon's ACL.
+**Client npub not in ACL:** Daemon sends `TUNNEL_REJECTED` with `ERR_ACL_DENIED`. tunnel-manager logs the rejection and exits 15. Operator must add client npub to daemon's `TUNNEL_ACL`.
 
-**Tunnel process crashes during operation:** tunnel-manager enters RECONNECTING. It attempts re-establishment up to `TUNNEL_RECONNECT_MAX` times, with 10-second gaps. On exhaustion, it sends a `TUNNEL_TEARDOWN` DM and signals ssl-setup via SIGUSR2. The container restarts (Docker `--restart on-failure:5`), and the full negotiation sequence begins again from IDLE.
+**WireGuard handshake failure:** `wg-quick up` succeeds but handshake never completes (e.g., firewall blocks UDP 51820). tunnel-manager detects stale handshake after 30 seconds, retries. After 3 failures, exits 16.
 
-**HAProxy REST API unreachable (remote):** Identical to local mode: exponential backoff up to 5 minutes, exit 13. The remote API URL is provided by the daemon in `TUNNEL_ACCEPTED`, so an unreachable API indicates the daemon gave an incorrect URL or the HAProxy process is down on the remote host.
+**Tunnel drops during operation:** WireGuard handles brief interruptions transparently (roaming). For longer outages (>90s without handshake), tunnel-manager enters RECONNECTING. If re-negotiation needed, sends new `TUNNEL_REQUEST`.
 
-**DNS propagation timeout:** ssl-setup proceeds after logging a warning. If nonce verification then fails (exit 10), the operator must investigate DNS. The tunnel remains established; manual DNS correction will unblock the nonce verification on the next container restart.
+**Client DynDNS update fails:** Client-side issue — HAProxy is not involved. Client retries according to its own DynDNS provider's error handling. ssl-setup's nonce verification will fail (exit 10) if DNS is wrong, triggering a retry.
 
-**Graceful shutdown race:** If SIGTERM arrives during tunnel negotiation (before ACTIVE state), tunnel-manager abandons the DM exchange and exits immediately. Since no `TUNNEL_ACCEPTED` was received, no ports were allocated on the remote side and no teardown DM is needed.
+**NAT/masquerade misconfigured:** Client can reach WireGuard peer (10.200.0.1) but not the internet. tunnel-manager detects this by attempting `curl --connect-timeout 5 https://ifconfig.me` after tunnel establishment. Logs warning; ssl-setup may fail at nonce verification.
 
 ---
 
-## 9. Integration with Existing ssl-setup.sh Flow
-
-The integration follows an **adapter pattern** at a single branch point in ssl-setup.sh, preserving all existing behavior when `REMOTE_HAPROXY_ID` is unset.
+## 10. Integration with Existing ssl-setup.sh Flow
 
 ### Modified ssl-setup.sh Flow
 
@@ -348,27 +474,24 @@ Step 0: SSL_DOMAIN check (unchanged)
 Step 0b: NEW — Remote tunnel mode detection
     if [ -n "${REMOTE_HAPROXY_ID:-}" ]; then
         tunnel-manager --start --wait-ready --timeout 300
-        # Blocks until ACTIVE state or exit code 15/16
+        # Blocks until WireGuard tunnel is ACTIVE or exit 15/16
         . /tmp/.ssl-tunnel-env
-        # HAPROXY_HOST, HAPROXY_API_PORT, HAPROXY_API_KEY overridden
-        # from values in .ssl-tunnel-env
-        HAPROXY_DETECTED="${HAPROXY_REMOTE_HOST}"
-        HAPROXY_IP="${HAPROXY_REMOTE_IP}"
-        # DNS propagation already handled by tunnel-manager
+        # HAPROXY_HOST now points to WireGuard server IP (10.200.0.1)
+        # All outbound traffic routes via wg0 transparently
     fi
     │
     ▼
 Step 1: Start ssl-http-proxy on port 80 (unchanged)
-    │
+    │   In remote mode: reachable via WireGuard at 10.200.0.N:80
     ▼
-Step 2: HAProxy registration (unchanged logic, remote URL used transparently)
-    │   In remote mode: payload gains tunnel_http_port + tunnel_https_port fields
-    │   These are ignored by local HAProxy API; remote daemon expects them
+Step 2: HAProxy registration (unchanged logic, WireGuard IP used transparently)
+    │   HAProxy backend points to 10.200.0.N:80 / :${SSL_HTTPS_PORT}
+    │   Aliases: each registered, HAProxy routes by domain to same peer IP
     ▼
 Step 3: Nonce verification (unchanged — traffic flows through tunnel)
     │
     ▼
-Step 4: Certificate acquisition (unchanged — certbot uses webroot on port 80)
+Step 4: Certificate acquisition (unchanged — certbot outbound routes via tunnel)
     │
     ▼
 Step 5: TLS verification (unchanged)
@@ -377,46 +500,61 @@ Step 5: TLS verification (unchanged)
 Step 6: Re-register with HTTPS port (unchanged)
     │
     ▼
-Step 7: Start ssl-renew (unchanged)
+Step 7: Alias handling (unchanged — each alias registered with HAProxy,
+    │   certbot obtains alias certs, ssl-alias-proxy started)
+    ▼
+Step 8: Start ssl-renew (unchanged)
     │
     ▼
-Step 8: Export /tmp/.ssl-env (unchanged)
+Step 9: Export /tmp/.ssl-env (unchanged)
 ```
-
-The key design principle is **zero modification to the core ssl-setup phases**. The tunnel makes the container's ports publicly reachable before ssl-setup begins its HAProxy and certbot work. From ssl-setup's perspective, the only difference is where the HAProxy API lives (remote URL vs. Docker network neighbor) and that those coordinates come from `/tmp/.ssl-tunnel-env` rather than `HAPROXY_HOST`.
 
 ### Backwards Compatibility
 
-If `REMOTE_HAPROXY_ID` is not set, the new code path is not executed. All existing environment variables, exit codes, log messages, file paths, and behavioral contracts remain identical. The only new dependency in the base image is `autossh`, which adds roughly 60KB and has no runtime overhead when unused.
+If `REMOTE_HAPROXY_ID` is not set, the new code path is not executed. All existing behavior is preserved. The new dependencies (wireguard-tools, Node.js/Sphere SDK) are installed in the base image but have zero runtime overhead when unused.
 
 ### Entrypoint Pattern (unchanged)
 
-The entrypoint script in derived images requires no modification. The `ssl-setup` exit code contract is preserved. The `/tmp/.ssl-env` file is written at the same point in the sequence. Apps that call `haproxy-register unregister` on shutdown also require no changes — the script will use the remote API URL sourced from the environment, which is populated from `/tmp/.ssl-tunnel-env` before the entrypoint calls ssl-setup.
+Derived image entrypoints require no modification. The ssl-setup exit code contract is preserved. `/tmp/.ssl-env` is written at the same point. Graceful shutdown with `haproxy-register unregister` works unchanged — the HAProxy API is reached via the WireGuard IP.
 
 ---
 
-## 10. Key Architectural Decisions
+## 11. Key Architectural Decisions
 
-**Why SSH remote forwarding over a VPN mesh (Tailscale, Nebula)?** SSH is universally available in Debian base images with zero additional kernel requirements. VPN solutions require either a userspace implementation (performance cost) or kernel modules (privilege escalation, host dependency). SSH remote forwarding is a well-understood, minimal-privilege mechanism with decades of operational track record. autossh provides robust process management with zero configuration complexity.
+**Why WireGuard over SSH port forwarding?** The requirement for bidirectional full-network transparency rules out SSH `-R`. The container must route ALL traffic (inbound and outbound) through the HAProxy host so that DynDNS calls, certbot ACME validation, and arbitrary outbound connections work as if the container is on the HAProxy's network. WireGuard provides this as a true VPN tunnel with minimal overhead. SSH would require bolting on SOCKS proxying, DNS forwarding, and per-service configuration — more complex than WireGuard.
 
-**Why Nostr/NIP-17 for the control channel rather than a direct REST API?** The client is behind a firewall with no inbound access. The daemon cannot reach the client to initiate a tunnel. Nostr provides a decentralized, encrypted, store-and-forward messaging substrate that both parties can connect to outbound. The alternative — a centralized MQTT broker or long-poll HTTP endpoint — would require the daemon operator to run additional infrastructure and would be a single point of failure. Nostr relay redundancy (multiple relay URLs) provides resilience without additional daemon-side infrastructure.
+**Why Sphere SDK for DM communication, not a custom Nostr client?** Sphere SDK is the Unicity ecosystem's standard communication layer. It already implements NIP-17 encrypted DMs, key management, relay pooling, and delivery guarantees. Writing a custom client would duplicate work, introduce bugs, and fragment the ecosystem. Both the client (tunnel-manager) and server (haproxy-tunnel-daemon) use Sphere SDK, ensuring protocol compatibility.
 
-**Why is the DNS record owned by the daemon?** The client does not know the remote HAProxy's public IP until after negotiation. Giving the client DNS credentials would require transmitting sensitive API keys in the DM channel, expanding the trust surface. The daemon, which controls the network egress IP, is the natural owner of the DNS record pointing to that IP.
+**Why haproxy-tunnel-daemon runs inside the HAProxy container?** The daemon needs direct access to: (1) HAProxy runtime API via Unix socket, (2) WireGuard interface via `wg` CLI, (3) iptables for NAT rules. Running inside the container avoids cross-container coordination, shared volume mounts, and Docker network namespace complexity. It's a single-container deployment — simpler to operate.
 
-**Why persist the SSH keypair in the letsencrypt volume?** The letsencrypt volume is already the persistent store for certificate material. Co-locating tunnel identity material avoids introducing a new volume mount. The alternative — regenerating the SSH key on every container restart — would require the daemon to update its `authorized_keys` on every restart, adding a round-trip DM exchange before every tunnel establishment.
+**Why the client manages its own DNS?** HAProxy MUST NOT handle client DNS credentials. The client knows its DNS provider, has its own API tokens, and is responsible for its own domain records. The tunnel provides transparent outbound connectivity so the client can call its DNS provider directly. HAProxy's only role in DNS is reporting its own public IP in the `TUNNEL_OFFER` so the client knows what value to set in the A record.
+
+**Why Nostr/NIP-17 for the control channel?** The client is behind a firewall — the daemon cannot reach it. Both sides can connect outbound to Nostr relays. Nostr provides decentralized, encrypted, store-and-forward messaging without requiring the daemon operator to run additional infrastructure. Relay redundancy provides resilience.
 
 ---
 
-## Appendix: File Locations (New)
+## Appendix A: File Locations (New)
 
 | Path | Purpose |
 |------|---------|
-| `/usr/local/bin/tunnel-manager` | Tunnel lifecycle orchestrator |
-| `/usr/local/bin/nostr-dm-client` | NIP-17 DM send/receive CLI |
-| `/etc/letsencrypt/tunnel-identity/` | Persistent SSH and Nostr keypairs |
-| `/etc/letsencrypt/tunnel-identity/id_rsa` | SSH private key for tunnel auth |
-| `/etc/letsencrypt/tunnel-identity/id_rsa.pub` | SSH public key (sent to daemon) |
-| `/etc/letsencrypt/tunnel-identity/nostr.json` | Nostr keypair (nsec, npub) |
+| `/usr/local/bin/tunnel-manager` | Tunnel lifecycle orchestrator (Node.js, Sphere SDK) |
+| `/etc/letsencrypt/tunnel-identity/` | Persistent Sphere SDK and WireGuard keypairs |
+| `/etc/letsencrypt/tunnel-identity/sphere-identity.json` | Sphere SDK keypair (npub, nsec) |
+| `/etc/letsencrypt/tunnel-identity/wg-private.key` | WireGuard client private key |
+| `/etc/letsencrypt/tunnel-identity/wg-public.key` | WireGuard client public key |
 | `/tmp/.ssl-tunnel-env` | Sourceable tunnel connection params |
-| `/tmp/.ssl-tunnel.pid` | PID of active tunnel process |
+| `/tmp/.ssl-tunnel.pid` | PID of WireGuard monitor process |
 | `/tmp/.ssl-tunnel-state` | Current tunnel-manager state (for debugging) |
+| `/etc/wireguard/wg0.conf` | WireGuard config (written by tunnel-manager) |
+
+## Appendix B: HAProxy Container Changes
+
+The HAProxy container (separate project) gains:
+
+| Component | Description |
+|-----------|-------------|
+| `haproxy-tunnel-daemon` | Node.js process, Sphere SDK, runs alongside HAProxy |
+| WireGuard server config | `wg0` interface on 10.200.0.1/24, listens UDP 51820 |
+| iptables NAT rules | MASQUERADE for 10.200.0.0/24 egress, FORWARD for peers |
+| Peer state directory | `/var/lib/haproxy-tunnel/peers/` — per-client WireGuard configs |
+| ACL config | `/etc/haproxy-tunnel/acl.json` — authorized client npubs |

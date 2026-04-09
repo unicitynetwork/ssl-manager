@@ -5,9 +5,11 @@
 For a containerized service behind a firewall that needs to establish client-initiated tunnels to a remote HAProxy server, we evaluated 10 major tunneling approaches.
 
 **Recommendation Hierarchy:**
-1. **Primary: SSH Reverse Tunnel + autossh** — proven, simple, secure, widely supported
-2. **Alternative 1: rathole / frp** — self-hosted control, high performance, zero vendor lock-in
-3. **Alternative 2: WireGuard** — maximum privacy/control, superior encryption properties
+1. **Primary: WireGuard** — full bidirectional VPN, modern crypto, kernel-level performance
+2. **Alternative 1: SSH tun device (`ssh -w`)** — fallback for older kernels without WireGuard
+3. **Alternative 2: rathole / frp** — when both WireGuard and SSH tun are unavailable
+
+**Critical requirement:** The container must have **full bidirectional network connectivity** through the tunnel — not just specific port forwards. The container must behave as if it is on the HAProxy host's network (outbound DynDNS calls, certbot, etc. all route through the tunnel). This rules out SSH `-R` (reverse port forwarding) as a primary option since it only forwards specific ports.
 
 ---
 
@@ -183,46 +185,49 @@ autossh -M 0 -o ServerAliveInterval=30 \
 
 ## Recommendations for ssl-manager
 
-### PRIMARY: SSH Reverse Tunnel + autossh
+### PRIMARY: WireGuard
 
-**Why:**
-- **Simplicity:** One SSH invocation, native Unix integration
-- **Security:** 30+ years of proven encryption/authentication
-- **Reliability:** autossh provides excellent keepalive and reconnection
-- **Compatibility:** Works with existing HAProxy API infrastructure
-- **Transparency:** Standard tools for debugging (SSH logs, netstat, ss)
-- **Zero vendor lock-in:** Pure open-source, no external services
-- **Docker size:** Negligible addition to base image (~60KB for autossh)
+**Why WireGuard is the clear choice for ssl-manager:**
+
+The critical requirement is **full bidirectional network transparency** — the container must behave as if it's on the HAProxy host's network. All traffic (inbound user requests AND outbound DynDNS calls, certbot ACME validation, etc.) must route through the tunnel. This eliminates per-port forwarding solutions (SSH `-R`, rathole, frp, bore) as primary options.
+
+- **True VPN:** `AllowedIPs = 0.0.0.0/0` routes ALL traffic through the tunnel
+- **NAT masquerade:** Container egress appears from HAProxy's public IP
+- **Performance:** Kernel-level, sub-millisecond latency, near-native throughput
+- **Security:** Modern AEAD ciphers, minimal attack surface (~4K LOC), formally verified
+- **Reconnection:** Handles roaming transparently (IP changes, brief outages)
+- **No per-port config:** HAProxy routes to WireGuard peer IP directly by domain name
+- **Multi-alias support:** Single peer connection serves all domains and ports
 
 **Integration pattern:**
-```bash
-autossh -M 0 \
-  -o ServerAliveInterval=30 \
-  -o ServerAliveCountMax=3 \
-  -o ExitOnForwardFailure=yes \
-  -i /etc/letsencrypt/tunnel-identity/id_rsa \
-  -R 127.0.0.1:${TUNNEL_HTTP_PORT}:localhost:80 \
-  -R 127.0.0.1:${TUNNEL_HTTPS_PORT}:localhost:${SSL_HTTPS_PORT} \
-  -p ${SSH_PORT} \
-  ${TUNNEL_USER}@${TUNNEL_HOST}
+```ini
+[Interface]
+PrivateKey = <client-private-key>
+Address = 10.200.0.2/32
+
+[Peer]
+PublicKey = <server-public-key>
+PresharedKey = <per-session-preshared-key>
+Endpoint = 198.51.100.42:51820
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
 ```
 
-### ALTERNATIVE 1: rathole or frp (Self-Hosted Infrastructure)
+**Trade-off:** Requires `NET_ADMIN` capability and Linux 5.6+ kernel. Adds ~5MB to base image.
 
-**When to use:** SSH port (22) is blocked by corporate firewall, or you need higher throughput than SSH provides, or you want richer monitoring/metrics.
+### ALTERNATIVE 1: SSH tun device (`ssh -w`)
 
-- **rathole:** Prioritize efficiency, throughput, minimal resource usage
-- **frp:** Need monitoring dashboard, complex setups, larger community
+**When to use:** Older kernels without WireGuard module. SSH `-w` creates a full network tunnel (layer 3 tun device), not just port forwards. Provides the same bidirectional connectivity as WireGuard but with higher overhead.
 
-### ALTERNATIVE 2: WireGuard (Advanced Networking)
+**Trade-off:** More complex to set up (tun device, routing tables, NAT). Higher CPU overhead than WireGuard. Requires root on both sides.
 
-**When to use:** Privacy properties matter more than simplicity, or you're building zero-trust network architectures, or you need sub-millisecond latency.
+### ALTERNATIVE 2: Chisel (Corporate Firewalls)
 
-**Trade-offs:** Complexity (networking knowledge required). Key management overhead. Docker security gotchas (CAP_NET_ADMIN).
+**When to use:** Both WireGuard UDP (51820) and SSH are blocked, but HTTP/HTTPS traffic is allowed. Chisel tunnels through WebSocket on port 443, penetrating corporate firewalls. Note: Chisel provides per-port forwarding, not full VPN — outbound traffic from the container would NOT route through the tunnel. Only suitable when the container has independent internet access for DynDNS/certbot.
 
-### ALTERNATIVE 3: Chisel (Corporate Firewalls)
+### NOT RECOMMENDED: SSH -R (Reverse Port Forwarding)
 
-**When to use:** Both SSH (port 22) and custom UDP (WireGuard) are blocked, but HTTP/HTTPS traffic is allowed. Common in corporate environments with deep packet inspection.
+SSH `-R` only forwards specific ports. It does NOT provide outbound routing. The container cannot make DynDNS API calls or certbot ACME requests through the tunnel. Would require bolting on SOCKS proxy, DNS forwarding, and per-service configuration — more complex than WireGuard.
 
 ---
 
@@ -230,10 +235,8 @@ autossh -M 0 \
 
 | Question | Answer | Choose |
 |----------|--------|--------|
-| Want simplest, most proven solution? | Yes | **SSH + autossh** |
-| Is port 22 blocked by firewall? | Yes | Chisel or rathole |
-| Need the lowest possible latency (<1ms)? | Yes | WireGuard |
-| Need rich monitoring/dashboard? | Yes | frp |
-| Need smallest binary/memory footprint? | Yes | rathole |
+| Need full bidirectional network? | Yes | **WireGuard** |
+| Kernel supports WireGuard (5.6+)? | No | SSH tun (`ssh -w`) |
+| Only HTTP/443 allowed outbound? | Yes | Chisel (limited) |
 | Is anonymity critical? | Yes | Tor (accept latency) |
 | OK with vendor lock-in? | Yes | Cloudflare Tunnel |

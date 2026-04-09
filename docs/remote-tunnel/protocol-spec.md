@@ -15,8 +15,9 @@ Each party is identified by a secp256k1 keypair (Unicity identity). The server's
 - **Negotiation is ephemeral.** DMs carry intent and credentials; the tunnel itself runs outside Nostr.
 - **Credentials are single-use and time-limited.** Every TUNNEL_OFFER includes an expiry. Unused offers are revoked server-side after expiry.
 - **The server drives tunnel type selection.** The client expresses preference order; the server makes the final choice based on its capabilities and policy.
-- **DNS is a side-channel.** DNS operations are handled as a sub-protocol within DTNP, not as a separate system.
+- **DNS is client-owned.** The client manages its own DynDNS credentials and updates. HAProxy never touches DNS credentials — it only reports its public IP so the client knows what A record value to set. The tunnel provides transparent outbound connectivity for the client's DNS API calls.
 - **Idempotency via correlation IDs.** Retransmitted messages with the same correlation ID are deduplicated at the receiver.
+- **Full bidirectional tunnel.** The tunnel is a VPN (WireGuard), not per-port forwarding. All client traffic routes through the tunnel, making the container behave as if it's on the HAProxy host's network.
 
 ### Protocol Versioning
 
@@ -62,24 +63,21 @@ Every DTNP message is a JSON object with the following envelope:
 
 ```json
 {
-  "domains": ["app.example.com", "www.example.com"],
+  "primary_domain": "app.example.com",
+  "domain_aliases": ["www.example.com", "api.example.com"],
   "ports": [
-    { "protocol": "http",  "server_port": 80,   "client_port": 8080 },
-    { "protocol": "https", "server_port": 443,  "client_port": 8443 },
-    { "protocol": "tcp",   "server_port": 50002,"client_port": 50002, "label": "electrum" }
+    { "protocol": "http",  "client_port": 80,    "description": "ssl-http-proxy" },
+    { "protocol": "https", "client_port": 443,   "description": "app TLS" },
+    { "protocol": "https", "client_port": 8444,  "description": "ssl-alias-proxy" },
+    { "protocol": "tcp",   "client_port": 50002, "label": "electrum-ssl" }
   ],
-  "tunnel_preference": ["wireguard", "chisel", "ssh"],
+  "tunnel_preference": ["wireguard", "ssh-tun"],
+  "client_wg_pubkey": "<base64-wireguard-public-key>",
   "client_meta": {
     "hostname": "fulcrum-alpha-1",
     "platform": "linux/amd64",
     "ssl_manager_version": "1.2.3",
-    "capabilities": ["haproxy-register-api", "nip17-dm"]
-  },
-  "dns_request": {
-    "provider": "cloudflare",
-    "zone_id": "abc123",
-    "auto_cleanup": true,
-    "credentials_enc": "<base64-encrypted-blob>"
+    "capabilities": ["haproxy-register-api", "sphere-sdk-dm"]
   },
   "ttl_seconds": 86400,
   "idempotency_key": "<uuid-v4>"
@@ -88,9 +86,13 @@ Every DTNP message is a JSON object with the following envelope:
 
 The `idempotency_key` is distinct from `correlation_id`. It represents the client's intent to establish a specific tunnel configuration. If the server has already accepted a request with this idempotency key and the tunnel is still ACTIVE, it MUST return the existing TUNNEL_OFFER rather than creating a duplicate.
 
-The `credentials_enc` field contains DynDNS provider credentials encrypted to the server's npub using NIP-04 (single-recipient encryption). This allows the server to perform DNS operations on the client's behalf without the credentials appearing in plaintext anywhere in the message chain.
+The `client_wg_pubkey` is the client's WireGuard public key, generated and persisted locally. The private key never leaves the client.
 
-The `tunnel_preference` list is ordered from most preferred to least. The server will select the first entry it supports.
+The `domain_aliases` array lists all alias domains the client needs routed. HAProxy will create backends for the primary domain plus all aliases, all pointing to the client's WireGuard peer IP. No per-alias port allocation is needed — HAProxy routes by domain to the appropriate client port.
+
+The `tunnel_preference` list is ordered from most preferred to least. WireGuard is the primary (full VPN, bidirectional). The server selects the first it supports.
+
+**Note:** There is no `dns_request` field. The client manages its own DNS. HAProxy MUST NOT handle client DNS credentials. The server reports its public IP in the TUNNEL_OFFER so the client knows what A record to set.
 
 ### 3.2 TUNNEL_OFFER (server → client)
 
@@ -102,25 +104,24 @@ The `tunnel_preference` list is ordered from most preferred to least. The server
     "port": 51820
   },
   "auth": {
-    "server_pubkey_wg": "base64-wireguard-pubkey",
+    "server_wg_pubkey": "base64-wireguard-pubkey",
     "client_ip_alloc": "10.200.0.2/32",
-    "server_ip": "10.200.0.1",
+    "server_ip": "10.200.0.1/24",
     "preshared_key_enc": "<base64-encrypted-blob>",
-    "allowed_ips": ["10.200.0.1/32"]
+    "allowed_ips": "0.0.0.0/0"
   },
-  "port_mappings": [
-    { "protocol": "http",  "server_port": 80,   "tunnel_dst_port": 8080 },
-    { "protocol": "https", "server_port": 443,  "tunnel_dst_port": 8443 },
-    { "protocol": "tcp",   "server_port": 50002,"tunnel_dst_port": 50002 }
+  "haproxy_public_ip": "198.51.100.42",
+  "haproxy_api": {
+    "host": "10.200.0.1",
+    "port": 8404,
+    "session_key": "<per-session-bearer-token>"
+  },
+  "haproxy_backends": [
+    { "domain": "app.example.com",     "http_target": "10.200.0.2:80", "https_target": "10.200.0.2:443" },
+    { "domain": "www.example.com",     "http_target": "10.200.0.2:80", "https_target": "10.200.0.2:8444" },
+    { "domain": "api.example.com",     "http_target": "10.200.0.2:80", "https_target": "10.200.0.2:8444" }
   ],
-  "dns_instructions": {
-    "records_to_create": [
-      { "type": "A", "name": "app.example.com", "value": "198.51.100.42", "ttl": 300 }
-    ],
-    "who_updates": "server",
-    "estimated_propagation_seconds": 60
-  },
-  "haproxy_backend_id": "fulcrum-alpha-1-20260409T120000Z",
+  "nat_masquerade": true,
   "offer_expires_at": "2026-04-09T13:00:00Z",
   "constraints": {
     "bandwidth_limit_mbps": null,
@@ -133,38 +134,27 @@ The `tunnel_preference` list is ordered from most preferred to least. The server
 }
 ```
 
-The `auth.preshared_key_enc` blob is encrypted to the client's npub using NIP-04. For SSH-based tunnels, `auth` would instead contain `authorized_key` (server's host key fingerprint) and `reverse_port` (the port on the SSH server that will be forwarded). The `auth` schema is polymorphic based on `tunnel_type`.
+Key fields:
 
-#### SSH Auth Schema
+- **`auth.preshared_key_enc`** — Encrypted to the client's npub using NIP-04. Single-use, generated per offer.
+- **`auth.allowed_ips: "0.0.0.0/0"`** — Routes ALL client traffic through the tunnel, giving the container full bidirectional connectivity through the HAProxy host's network.
+- **`haproxy_public_ip`** — The IP the client should use as its DNS A record value. The client updates its own DNS; the server never touches client DNS credentials.
+- **`haproxy_api`** — The HAProxy Registration API endpoint, reachable via the WireGuard tunnel IP (10.200.0.1). The `session_key` is a per-tunnel bearer token.
+- **`haproxy_backends`** — Pre-computed backend routing for primary domain + all aliases. The server uses the client's WireGuard peer IP directly, routing by domain name.
+- **`nat_masquerade: true`** — Confirms the server will NAT/masquerade client egress traffic so the container appears to originate from the HAProxy's public IP. This enables transparent DynDNS API calls, certbot ACME validation, and arbitrary outbound connections.
 
-```json
-{
-  "auth": {
-    "host_key_fingerprint": "SHA256:abc123...",
-    "tunnel_user": "ssl-tunnel",
-    "ssh_port": 2222,
-    "reverse_forwards": [
-      { "remote_bind": "127.0.0.1:21080", "description": "http" },
-      { "remote_bind": "127.0.0.1:21443", "description": "https" }
-    ]
-  }
-}
-```
-
-`who_updates` in `dns_instructions` is either `"server"` (server will call the DNS API using the credentials the client supplied) or `"client"` (server provides records and the client updates DNS directly). The default is `"server"` when credentials were provided in TUNNEL_REQUEST.
+**DNS is client-managed.** There is no `dns_instructions` or `who_updates` field. The client receives `haproxy_public_ip` and updates its own DNS records using its own credentials via the tunnel's outbound connectivity.
 
 ### 3.3 TUNNEL_ACCEPT (client → server)
 
 ```json
 {
   "accepted_tunnel_type": "wireguard",
-  "client_wg_pubkey": "base64-wireguard-client-pubkey",
-  "client_wg_listen_port": 0,
   "ready_at": "2026-04-09T12:05:00Z"
 }
 ```
 
-For SSH tunnels, this instead carries the client's SSH public key. For chisel, it carries no additional auth material (chisel uses TLS with a pre-shared key from the offer). The field names are prefixed by tunnel type (`client_wg_pubkey`, `client_ssh_pubkey`, etc.).
+The client's WireGuard public key was already provided in `TUNNEL_REQUEST.client_wg_pubkey`, so no additional auth material is needed in the accept message. This message confirms the client will use the offered tunnel parameters and is about to bring up its WireGuard interface.
 
 ### 3.4 TUNNEL_ESTABLISHED (client → server)
 
@@ -199,38 +189,7 @@ This message is the client's confirmation that it has successfully brought up th
 
 Either party may send TUNNEL_HEARTBEAT. If the server misses `heartbeat_missed_limit` consecutive heartbeats from the client, it MUST send TUNNEL_TEARDOWN with reason `TIMEOUT`. The client tracks server heartbeats and initiates RECONNECTING if the server side goes silent.
 
-### 3.6 TUNNEL_DNS_REQUEST (client → server)
-
-```json
-{
-  "operation": "UPDATE",
-  "records": [
-    { "type": "A", "name": "app.example.com", "value": "198.51.100.42", "ttl": 300 }
-  ],
-  "provider": "cloudflare",
-  "zone_id": "abc123",
-  "credentials_enc": "<base64-encrypted-blob>"
-}
-```
-
-`operation` is one of `CREATE`, `UPDATE`, `DELETE`. The client may send this independently of tunnel negotiation to update DNS records when its tunnel IP changes or when renewing. If credentials were already provided in TUNNEL_REQUEST, the `credentials_enc` field MAY be omitted and the server reuses cached credentials (stored encrypted, keyed to `correlation_id`).
-
-### 3.7 TUNNEL_DNS_RESPONSE (server → client)
-
-```json
-{
-  "operation": "UPDATE",
-  "status": "success",
-  "records_applied": [
-    { "type": "A", "name": "app.example.com", "value": "198.51.100.42", "ttl": 300, "provider_record_id": "xyz789" }
-  ],
-  "error": null
-}
-```
-
-On failure, `status` is `"error"` and `error` is a structured object `{ "code": "ERR_DNS_AUTH_FAILED", "message": "..." }`.
-
-### 3.8 TUNNEL_TEARDOWN (either direction)
+### 3.6 TUNNEL_TEARDOWN (either direction)
 
 ```json
 {
@@ -242,9 +201,9 @@ On failure, `status` is `"error"` and `error` is a structured object `{ "code": 
 }
 ```
 
-`reason` is one of: `GRACEFUL_SHUTDOWN`, `TIMEOUT`, `ERROR`, `EVICTION`, `CERTIFICATE_EXPIRY`, `TUNNEL_FAILURE`, `SERVER_MAINTENANCE`. When `cleanup_dns` is true, the server MUST delete all DNS records created for this tunnel session. When `cleanup_haproxy` is true, the server MUST deregister the backend from HAProxy.
+`reason` is one of: `GRACEFUL_SHUTDOWN`, `TIMEOUT`, `ERROR`, `EVICTION`, `CERTIFICATE_EXPIRY`, `TUNNEL_FAILURE`, `SERVER_MAINTENANCE`. When `cleanup_haproxy` is true, the server MUST deregister all HAProxy backends for this tunnel session and remove the WireGuard peer. DNS cleanup is the client's responsibility — the client should update its own DNS records as part of its shutdown procedure. `cleanup_dns` is advisory: it tells the server whether the client intends to clean up its DNS (informational only, server takes no DNS action).
 
-### 3.9 TUNNEL_REJECTED (server → client)
+### 3.7 TUNNEL_REJECTED (server → client)
 
 ```json
 {
@@ -258,7 +217,7 @@ On failure, `status` is `"error"` and `error` is a structured object `{ "code": 
 
 Reason codes: `ERR_CAPACITY`, `ERR_ACL_DENIED`, `ERR_DOMAIN_CONFLICT`, `ERR_UNSUPPORTED_TUNNEL`, `ERR_VERSION_MISMATCH`, `ERR_INVALID_CREDENTIALS`, `ERR_RATE_LIMITED`, `ERR_DOMAIN_INVALID`.
 
-### 3.10 TUNNEL_ERROR (either direction)
+### 3.8 TUNNEL_ERROR (either direction)
 
 ```json
 {
@@ -387,69 +346,47 @@ All retries use truncated exponential backoff: wait `min(2^attempt * base_second
 
 ## 5. Sequence Diagrams
 
-### 5.1 Happy Path (WireGuard + Cloudflare DNS)
+### 5.1 Happy Path (WireGuard + Client-Managed DNS)
 
 ```
 Client                          Nostr Relay                     Server (HAProxy)
   │                                  │                                │
   │──TUNNEL_REQUEST─────────────────►│──────────────────────────────►│
-  │  (domains, ports, wg pref,       │                                │
-  │   dns creds encrypted to server) │                                │
+  │  (primary_domain, aliases,       │                                │
+  │   ports, client_wg_pubkey)       │                                │
   │                                  │                                │ validate ACL,
-  │                                  │                                │ allocate WG peer,
-  │                                  │                                │ generate credentials
+  │                                  │                                │ allocate WG peer IP,
+  │                                  │                                │ generate preshared key,
+  │                                  │                                │ configure HAProxy backends
   │◄─────────────────────────────────│◄──────TUNNEL_OFFER────────────│
   │  (wg endpoint, server pubkey,    │                                │
-  │   preshared key enc to client,   │                                │
-  │   dns_instructions)              │                                │
+  │   client IP, preshared key enc,  │                                │
+  │   haproxy_public_ip, api creds)  │                                │
   │                                  │                                │
-  │ [configure wg interface]         │                                │
+  │ [write wg0.conf]                 │                                │
   │                                  │                                │
   │──TUNNEL_ACCEPT──────────────────►│──────────────────────────────►│
-  │  (client_wg_pubkey)              │                                │ [add peer to wg,
-  │                                  │                                │  update HAProxy backend,
-  │                                  │                                │  call Cloudflare DNS API]
-  │ [bring wg up, ping 10.200.0.1]  │                                │
+  │                                  │                                │ [add WG peer,
+  │                                  │                                │  configure iptables NAT,
+  │                                  │                                │  configure HAProxy backends]
+  │ [wg-quick up wg0]               │                                │
+  │ [ping 10.200.0.1 ✓]             │                                │
   │                                  │                                │
   │──TUNNEL_ESTABLISHED─────────────►│──────────────────────────────►│
-  │  (health_endpoint, rtt_ms)       │                                │ [verify health endpoint,
-  │                                  │                                │  update HAProxy backend HTTPS,
+  │  (health_endpoint, rtt_ms)       │                                │ [verify health via WG IP,
   │                                  │                                │  session = ACTIVE]
-  │◄─────────────────────────────────│◄──TUNNEL_HEARTBEAT (initial)──│
+  │                                  │                                │
+  │ [CLIENT updates own DNS:]        │                                │
+  │ [curl DynDNS API via wg0→NAT]   │                                │
+  │ [A record → haproxy_public_ip]   │                                │
+  │                                  │                                │
+  │ [ssl-setup proceeds normally:]   │                                │
+  │ [nonce verify, certbot, etc.]    │                                │
+  │ [all traffic via WG tunnel]      │                                │
   │                                  │                                │
   │──TUNNEL_HEARTBEAT───────────────►│──────────────────────────────►│
+  │◄─────────────────────────────────│◄──TUNNEL_HEARTBEAT────────────│
   │  (every 30s, bidirectional)      │                                │
-```
-
-### 5.2 Happy Path (SSH + Server-Managed DNS)
-
-```
-Client                          Nostr Relay                     Server (HAProxy)
-  │                                  │                                │
-  │──TUNNEL_REQUEST─────────────────►│──────────────────────────────►│
-  │  (domains, ports, ssh pref,      │                                │
-  │   client_ssh_pubkey)             │                                │
-  │                                  │                                │ validate ACL,
-  │                                  │                                │ allocate loopback ports,
-  │                                  │                                │ add SSH authorized_key
-  │◄─────────────────────────────────│◄──────TUNNEL_OFFER────────────│
-  │  (ssh endpoint, host_key_fp,     │                                │
-  │   reverse_forwards, dns_action:  │                                │
-  │   managed, dns_target: pub_ip)   │                                │
-  │                                  │                                │
-  │──TUNNEL_ACCEPT──────────────────►│──────────────────────────────►│
-  │                                  │                                │ [update DNS A record,
-  │                                  │                                │  configure HAProxy HTTP backend]
-  │ [verify host key fingerprint]    │                                │
-  │ [autossh -R 127.0.0.1:21080:... ]│                                │
-  │ [autossh -R 127.0.0.1:21443:... ]│                                │
-  │                                  │                                │
-  │──TUNNEL_ESTABLISHED─────────────►│──────────────────────────────►│
-  │                                  │                                │ [health check, ACTIVE]
-  │                                  │                                │
-  │  ... ssl-setup proceeds normally ...                              │
-  │  ... certbot HTTP-01 via tunnel ...                               │
-  │  ... re-register with HTTPS ...                                   │
 ```
 
 ### 5.3 Reconnection Scenario
@@ -489,10 +426,11 @@ Client                                                          Server
   │  [tunnel ACTIVE, container receives SIGTERM]                  │
   │                                                               │
   │──TUNNEL_TEARDOWN──────────────────────────────────────────────►│
-  │  (GRACEFUL_SHUTDOWN, cleanup_dns: true,                       │ [delete DNS record,
-  │   cleanup_haproxy: true)                                      │  deregister HAProxy backend,
-  │                                                               │  revoke tunnel credentials]
-  │  [kill tunnel process, exit]                                  │
+  │  (GRACEFUL_SHUTDOWN, cleanup_dns: true,                       │ [remove WireGuard peer,
+  │   cleanup_haproxy: true)                                      │  deregister HAProxy backends,
+  │                                                               │  remove iptables NAT rules]
+  │  [client updates own DNS if needed]                           │
+  │  [wg-quick down wg0, exit]                                    │
 ```
 
 ---
@@ -513,9 +451,11 @@ The combination of `correlation_id` + `sequence` prevents replay attacks within 
 
 ### 6.3 Credential Handling
 
-Tunnel credentials (WireGuard preshared keys, SSH keys) are single-use and generated fresh per TUNNEL_OFFER. They are encrypted to the recipient's npub using NIP-04 before inclusion in the JSON payload, meaning they are doubly encrypted: once by NIP-04 for the credential blob, and again by NIP-17 for the message envelope.
+Tunnel credentials (WireGuard preshared keys) are single-use and generated fresh per TUNNEL_OFFER. They are encrypted to the recipient's npub using NIP-04 before inclusion in the JSON payload, meaning they are doubly encrypted: once by NIP-04 for the credential blob, and again by NIP-17 for the message envelope.
 
-DynDNS credentials follow the same pattern. The server MUST NOT log or persist credentials in plaintext. After tunnel teardown, the server MUST delete any in-memory credential cache associated with the `correlation_id`.
+The server MUST NOT log or persist credentials in plaintext. After tunnel teardown, the server MUST delete any credential material associated with the `correlation_id`.
+
+**DNS credentials are never part of DTNP.** The client manages its own DNS using its own credentials via the tunnel's outbound connectivity. The server never sees, stores, or handles DNS credentials.
 
 ### 6.4 Tunnel Transport Security
 
@@ -525,31 +465,23 @@ For SSH-based tunnels, the client MUST verify the server's host key fingerprint 
 
 ---
 
-## 7. DNS Integration Protocol
+## 7. DNS Model
 
-### 7.1 Credential Flow
+### Principle: Client Owns DNS
 
-1. Client encrypts DynDNS API credentials to the server's npub using NIP-04 and includes the ciphertext in `TUNNEL_REQUEST.dns_request.credentials_enc`.
-2. Server decrypts credentials in memory and stores them associated with the session's `correlation_id`.
-3. Server performs DNS API calls directly (Cloudflare, Route53, etc.) using these credentials. The client never exposes them on a network path other than the encrypted DM.
-4. The server includes `who_updates: "server"` in TUNNEL_OFFER, confirming it has accepted responsibility for DNS.
-5. On TUNNEL_TEARDOWN with `cleanup_dns: true`, the server calls the DNS provider to delete records, then zeroes out the credential cache.
+**The server (HAProxy) MUST NOT manage, store, or handle client DNS credentials.** DNS is entirely the client's responsibility. The server's only DNS-related role is reporting its own public IP in `TUNNEL_OFFER.haproxy_public_ip`.
 
-### 7.2 DNS Provider Abstraction
+### How DNS Works with the Tunnel
 
-The `provider` field in `TUNNEL_DNS_REQUEST` identifies the DNS provider by a short string (`cloudflare`, `route53`, `digitalocean`, `namecheap`, `duckdns`, etc.). The server implements a provider adapter for each supported string. If the client specifies an unsupported provider, the server returns `ERR_UNSUPPORTED_TUNNEL` in TUNNEL_REJECTED with a `supported_dns_providers` list.
+1. Client receives `TUNNEL_OFFER` containing `haproxy_public_ip` (e.g., `198.51.100.42`).
+2. Client updates its own DNS using its own credentials. Because the WireGuard tunnel provides full bidirectional connectivity with NAT masquerade, the client's outbound API calls to its DNS provider route transparently through the tunnel and appear to originate from the HAProxy host's IP.
+3. For all domains (primary + aliases), the client sets A records pointing to `haproxy_public_ip`.
+4. Client waits for DNS propagation, then ssl-setup proceeds with nonce verification.
+5. On teardown, the client is responsible for cleaning up its own DNS records.
 
-If no `dns_request` is included in TUNNEL_REQUEST, the server assumes the client will manage DNS out-of-band and sets `who_updates: "client"` in TUNNEL_OFFER, including the records the client should create.
+### No DNS Messages in DTNP
 
-### 7.3 Propagation and Verification
-
-After creating DNS records, the server sends TUNNEL_OFFER. The `dns_instructions.estimated_propagation_seconds` field tells the client how long to wait before expecting domain-based verification to succeed. The client MUST wait at least this long before running ssl-setup's nonce-based HTTP reachability check.
-
-If DNS propagation fails within 2x the estimated time, the client sends TUNNEL_DNS_REQUEST with `operation: UPDATE` to force a re-apply. The server acknowledges with TUNNEL_DNS_RESPONSE. After 3 failed DNS operations, the client sends TUNNEL_ERROR with `ERR_DNS_PROPAGATION_TIMEOUT` and `recoverable: false`.
-
-### 7.4 Cleanup Semantics
-
-On any TUNNEL_TEARDOWN (graceful or otherwise), the server evaluates `cleanup_dns`. If `true`, records are deleted. If the teardown is server-initiated (timeout, eviction), the server SHOULD attempt cleanup regardless and send a TUNNEL_TEARDOWN to notify the client. If the DNS API call fails during cleanup, the server MUST log this and MAY retry asynchronously up to 3 times.
+There are no `TUNNEL_DNS_REQUEST` or `TUNNEL_DNS_RESPONSE` message types. The protocol does not include DNS operations — they are handled entirely by the client through standard outbound internet connectivity provided by the tunnel.
 
 ---
 
@@ -588,9 +520,7 @@ A future extension could allow servers to forward TUNNEL_REQUEST to peer servers
 | `ERR_CAPACITY` | S→C | Server at tunnel limit |
 | `ERR_UNSUPPORTED_TUNNEL` | S→C | No common tunnel type found |
 | `ERR_RATE_LIMITED` | S→C | Too many requests from this client |
-| `ERR_INVALID_CREDENTIALS` | S→C | Credentials malformed or cannot be decrypted |
-| `ERR_DNS_AUTH_FAILED` | S→C | DNS provider credentials rejected |
-| `ERR_DNS_PROPAGATION_TIMEOUT` | C→S | DNS not visible after max wait |
+| `ERR_INVALID_CREDENTIALS` | S→C | WireGuard credentials malformed or cannot be decrypted |
 | `ERR_TUNNEL_HEALTH_FAILED` | S→C | Health endpoint unreachable after ESTABLISHED |
 | `ERR_UNKNOWN_MESSAGE_TYPE` | Both | Unrecognized extension msg_type |
 | `ERR_SEQUENCE_REPLAY` | Both | Sequence number below expected |
