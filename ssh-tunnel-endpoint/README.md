@@ -119,6 +119,27 @@ To capture an **already-deployed** fingerprint that was auto-generated into the 
 docker cp <container>:/etc/ssh/keys/. hostkeys/
 ```
 
+## Persistence & host reboot
+
+The endpoint comes back **automatically after a host reboot**, with the **same fingerprint**,
+so clients keep working without re-pinning. What guarantees it:
+
+- **`restart: unless-stopped`** on the service — Docker restarts the container when the daemon
+  starts (unless you explicitly stopped it). The container keeps its stored config (published
+  port, `haproxy-net`, mounts), so nothing needs re-passing at boot.
+- **Docker starts on boot** (`systemctl enable docker`) — the daemon comes up after reboot.
+- **`haproxy-net`** is an ordinary Docker network — it persists across reboots and is available
+  before containers are (re)started, so the endpoint re-attaches cleanly.
+- **Host key on persistent storage** — the bind-mounted `hostkeys/` (and the `…-hostkeys`
+  volume) live on disk; the entrypoint reinstalls the key on every start, so the pinned
+  `SHA256:…` fingerprint is unchanged.
+- **haproxy** is likewise `restart: unless-stopped`, so SNI routing returns.
+
+Sequence after reboot: dockerd starts → restores `haproxy-net` → restarts `haproxy` + the
+endpoint → the endpoint reinstalls the stable host key → clients reconnect against the same
+pin. A plain `docker restart <container>` exercises the same come-back path if you want to
+sanity-check it (verify with `ssh-keyscan -p 2222 <host> | ssh-keygen -lf -`).
+
 ## Rotate / revoke
 
 - Revoke a host: delete its line from `authorized_keys`, `docker compose restart`.
