@@ -1,14 +1,26 @@
 #!/bin/sh
-# staging-tunnel entrypoint: persist host keys, install developer authorized_keys, run sshd.
+# staging-tunnel entrypoint: install host keys + developer authorized_keys, run sshd.
 set -eu
 
 mkdir -p /etc/ssh/keys
-# Generate persistent host keys on first run (kept in the mounted /etc/ssh/keys volume).
-if [ ! -f /etc/ssh/keys/ssh_host_ed25519_key ]; then
-  echo "[staging-tunnel] generating host keys"
-  ssh-keygen -t ed25519 -f /etc/ssh/keys/ssh_host_ed25519_key -N '' >/dev/null
+# Host keys — for a STABLE, reproducible fingerprint that survives volume loss, prefer an
+# operator-provided key: the staging-tunnel dir is mounted read-only at /auth-src, so a
+# gitignored hostkeys/ appears at /auth-src/hostkeys/. When present it is authoritative
+# (re-installed every start). Otherwise fall back to generating into the persistent volume
+# (stable across restarts, but a fresh fingerprint if the volume is ever recreated).
+if [ -f /auth-src/hostkeys/ssh_host_ed25519_key ]; then
+  echo "[staging-tunnel] using operator-provided host key(s) from hostkeys/ (stable)"
+  for k in ssh_host_ed25519_key ssh_host_rsa_key; do
+    [ -f "/auth-src/hostkeys/$k" ]     && install -m 600 "/auth-src/hostkeys/$k"     "/etc/ssh/keys/$k"
+    [ -f "/auth-src/hostkeys/$k.pub" ] && install -m 644 "/auth-src/hostkeys/$k.pub" "/etc/ssh/keys/$k.pub"
+  done
+else
+  if [ ! -f /etc/ssh/keys/ssh_host_ed25519_key ]; then
+    echo "[staging-tunnel] generating host keys (no hostkeys/ mounted — not portable across volume loss)"
+    ssh-keygen -t ed25519 -f /etc/ssh/keys/ssh_host_ed25519_key -N '' >/dev/null
+  fi
+  [ -f /etc/ssh/keys/ssh_host_rsa_key ] || ssh-keygen -t rsa -b 3072 -f /etc/ssh/keys/ssh_host_rsa_key -N '' >/dev/null
 fi
-[ -f /etc/ssh/keys/ssh_host_rsa_key ] || ssh-keygen -t rsa -b 3072 -f /etc/ssh/keys/ssh_host_rsa_key -N '' >/dev/null
 
 # Install developer keys. The staging-tunnel dir is mounted read-only at /auth-src
 # (mounting the dir, not the file, avoids Docker auto-creating an empty-dir shadow when

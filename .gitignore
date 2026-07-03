@@ -5,3 +5,6 @@ tunnel-daemon/node_modules/
 
 # ssh-tunnel-endpoint developer keys (never commit) — keep only authorized_keys.example
 ssh-tunnel-endpoint/authorized_keys
+
+# ssh-tunnel-endpoint host keys (operator-provided, stable fingerprint) — never commit
+ssh-tunnel-endpoint/hostkeys/
