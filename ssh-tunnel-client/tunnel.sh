@@ -1,8 +1,7 @@
 #!/bin/sh
 # tunnel-client — expose a service running on a firewalled host through the shared
 # haproxy, with no public IP on the service's host. Pairs with the staging-tunnel sshd
-# endpoint (see ../staging-tunnel). Generic: tunnel ANY http/https service, not just
-# concierge.
+# endpoint (see ../ssh-tunnel-endpoint). Generic: tunnel ANY http/https service.
 #
 # It opens:
 #   ssh -R 0.0.0.0:<rport>:<TARGET_HOST>:<TARGET_PORT>   (public :80/:443 -> here -> service)
@@ -98,6 +97,15 @@ register() {  # register RPORT -> 0 on success
     _body="{\"domain\":\"${DOMAIN}\",\"container\":\"${ENDPOINT_ALIAS}\",\"http_port\":null,\"https_port\":${_rp}}"
   fi
   _code="$(api POST /v1/backends "$_body" || true)"
+  # A 409 means the domain is already registered (e.g. a stale entry from a hard-killed
+  # prior instance). If WE own it (same endpoint), the ownership-scoped DELETE succeeds and
+  # the retry registers; if a different container owns it, the DELETE 403s and we fail (as
+  # we should — don't hijack another backend's domain).
+  if [ "$_code" = 409 ]; then
+    warn "register 409 for ${DOMAIN} (already registered) — deleting our stale entry and retrying"
+    deregister
+    _code="$(api POST /v1/backends "$_body" || true)"
+  fi
   case "$_code" in
     200|201) log "registered ${DOMAIN} -> ${ENDPOINT_ALIAS}:${_rp} (${MODE}, haproxy $_code)"; return 0 ;;
     *) warn "register returned $_code for ${DOMAIN}"; return 1 ;;
@@ -208,6 +216,9 @@ while true; do
   # Don't advertise a backend that isn't actually answering (would 502 through the tunnel).
   if ! service_reachable; then
     warn "target ${TARGET_HOST}:${TARGET_PORT} (${MODE}) not answering — not registering; retrying in 10s"
+    # If a prior round registered this domain, drop that entry now (its tunnel is gone) so
+    # haproxy doesn't keep fronting a dead port while the service is down.
+    [ "$EVER_REGISTERED" = 1 ] && deregister || true
     kill "$SSH_PID" 2>/dev/null || true
     wait "$SSH_PID" 2>/dev/null || true
     sleep 10
@@ -226,6 +237,8 @@ while true; do
 
   if [ "$registered_now" != 1 ]; then
     warn "registration failed after retries — NOT live; tearing down and retrying"
+    # Drop any stale entry from a prior successful round so haproxy stops fronting it.
+    [ "$EVER_REGISTERED" = 1 ] && deregister || true
     kill "$SSH_PID" 2>/dev/null || true
     wait "$SSH_PID" 2>/dev/null || true
     sleep 10

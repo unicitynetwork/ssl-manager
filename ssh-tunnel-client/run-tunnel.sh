@@ -45,7 +45,7 @@ done
 TARGET_HOST="${TARGET%%:*}"; TARGET_PORT="${TARGET##*:}"
 [ "$TARGET_HOST" != "$TARGET_PORT" ] || { echo "--target must be HOST:PORT" >&2; exit 2; }
 KEY="$(cd "$(dirname "$KEY")" && pwd)/$(basename "$KEY")"
-[ -n "$NAME" ] || NAME="tunnel-$(printf '%s' "$DOMAIN" | tr -c 'a-z0-9' '-' | sed 's/-\+/-/g;s/^-//;s/-$//')"
+[ -n "$NAME" ] || NAME="tunnel-$(printf '%s' "$DOMAIN" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/--*/-/g; s/^-//; s/-$//')"
 
 # Build image if absent
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then

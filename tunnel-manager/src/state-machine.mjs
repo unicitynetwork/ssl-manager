@@ -106,6 +106,14 @@ export class TunnelStateMachine {
     // ---- BOOTSTRAPPING ----
     this._setState(CLIENT_STATE.BOOTSTRAPPING);
 
+    // The SSH 'lite' mode was retired from this DTNP client — it now lives, negotiation-
+    // free, in ../ssh-tunnel-client. Fail fast with a clear message instead of negotiating
+    // WireGuard with an empty keypair (index.mjs only generates keys for mode 'full').
+    if (this.config.tunnelMode !== 'full') {
+      err(`tunnelMode='${this.config.tunnelMode}' is not supported by this DTNP client — the SSH 'lite' mode moved to ../ssh-tunnel-client. Set TUNNEL_MODE=full (WireGuard).`);
+      return EXIT_CODES.TUNNEL_FAILED;
+    }
+
     // Check tunnel capability. This DTNP client is WireGuard-only; the lightweight,
     // negotiation-free SSH-reverse ("ssh-lite") mode lives in ../ssh-tunnel-client.
     const wgCheck = checkWireGuardAvailability();
