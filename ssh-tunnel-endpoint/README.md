@@ -51,6 +51,25 @@ not part of this component.
    The `container_name` (haproxy-net alias haproxy routes to) defaults to `staging-tunnel`;
    override with `TUNNEL_ENDPOINT_NAME` and have clients set `TUNNEL_ENDPOINT_ALIAS` to match.
 
+## Stable host key
+
+For a **stable, reproducible** fingerprint that survives volume loss (and is identical
+across hosts), provide the host key instead of letting the container auto-generate one:
+
+```bash
+# generate once (or reuse an existing key) into the gitignored hostkeys/ dir
+mkdir -p hostkeys
+ssh-keygen -t ed25519 -N '' -f hostkeys/ssh_host_ed25519_key
+ssh-keygen -t rsa -b 3072 -N '' -f hostkeys/ssh_host_rsa_key
+docker compose up -d --build       # entrypoint installs hostkeys/ (authoritative)
+```
+
+`hostkeys/` is gitignored — **back it up**, never commit it. When present it is used on
+every start, so `docker compose down -v` / a wiped volume / a redeploy on another host all
+keep the same `SHA256:…` pin. Without a `hostkeys/` dir the entrypoint falls back to
+generating into the persistent volume (stable across restarts, but a new fingerprint if the
+volume is ever recreated).
+
 ## Security model
 
 - **Key-only, no shell, no PTY.** `restrict,port-forwarding` disables everything except the
