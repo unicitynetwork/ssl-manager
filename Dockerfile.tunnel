@@ -1,0 +1,54 @@
+# ssl-manager:tunnel — Base image with tunnel dependencies
+#
+# Extends the standard ssl-manager image with WireGuard, wstunnel,
+# Node.js, and Sphere SDK for remote HAProxy tunneling.
+#
+# Usage:
+#   FROM ghcr.io/unicitynetwork/ssl-manager:tunnel
+
+FROM ghcr.io/unicitynetwork/ssl-manager:latest
+
+# Install tunnel-specific dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        wireguard-tools \
+        iproute2 \
+        iptables \
+        autossh \
+        openssh-client \
+        nodejs \
+        npm \
+        iputils-ping \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Validate Node.js version (require 18.x, 20.x, or 22.x)
+RUN node --version | grep -qE '^v(18|20|22)\.' || { echo "Unsupported Node.js version: $(node --version)"; exit 1; }
+
+# Tunnel manager (Node.js client-side component)
+COPY tunnel-manager/ /usr/local/bin/tunnel-manager/
+RUN cd /usr/local/bin/tunnel-manager && npm install --production \
+    && test -d node_modules  # fail if npm install produced nothing
+
+# Create wrapper script for tunnel-manager
+RUN printf '#!/bin/bash\nexec node /usr/local/bin/tunnel-manager/src/index.mjs "$@"\n' \
+    > /usr/local/bin/tunnel-manager-bin \
+    && chmod +x /usr/local/bin/tunnel-manager-bin \
+    && ln -sf /usr/local/bin/tunnel-manager-bin /usr/local/bin/tunnel-manager
+
+# ACME challenge webroot directory
+RUN mkdir -p /var/www/acme-challenge/.well-known/acme-challenge
+
+# WireGuard config directory
+RUN mkdir -p /etc/wireguard
+
+# Tunnel identity directory (will be inside letsencrypt volume)
+RUN mkdir -p /etc/letsencrypt/tunnel-identity && chmod 700 /etc/letsencrypt/tunnel-identity
+
+# Ports:
+#   80   — HTTP reverse proxy (ACME challenges + app forwarding)
+#   8444 — TLS alias proxy (alias domain termination)
+EXPOSE 80
+EXPOSE 8444
+
+# Let's Encrypt certificate storage + tunnel identity
+VOLUME ["/etc/letsencrypt"]

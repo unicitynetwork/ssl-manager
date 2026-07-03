@@ -1,0 +1,38 @@
+# SSH tunnel endpoint — run on the haproxy host (joins the shared external haproxy-net).
+#
+#   # 1. add developer public keys (tunnel-only) first:
+#   cp authorized_keys.example authorized_keys && $EDITOR authorized_keys
+#   # 2. bring it up (host port 2022 may be taken — override with TUNNEL_SSH_PORT):
+#   TUNNEL_SSH_PORT=2222 docker compose up -d --build
+#   docker logs <name> | grep -A1 fingerprint     # copy the SHA256:... host-key pin
+#
+# The reverse-tunnel bind ports (default 21000-21099) must be in haproxy's ALLOWED_PORTS
+# (see the haproxy repo's internal-ports.conf) — that is haproxy config, not part of this
+# component. See README.md.
+services:
+  ssh-tunnel-endpoint:
+    build:
+      context: .
+    image: ssh-tunnel-endpoint:latest
+    # The haproxy-net alias haproxy routes tunnel backends to; clients set it as
+    # TUNNEL_ENDPOINT_ALIAS. Default kept as `staging-tunnel` for the already-deployed
+    # endpoint; override TUNNEL_ENDPOINT_NAME to use a different alias.
+    container_name: ${TUNNEL_ENDPOINT_NAME:-staging-tunnel}
+    restart: unless-stopped
+    ports:
+      - "${TUNNEL_SSH_PORT:-2022}:22"
+    volumes:
+      # Mount the DIRECTORY (always exists), not the file — a missing authorized_keys file
+      # source would make Docker auto-create an empty dir and start sshd with zero keys.
+      - .:/auth-src:ro
+      # Persist host keys so the client-pinned fingerprint is stable across restarts.
+      - ssh-tunnel-hostkeys:/etc/ssh/keys
+    networks:
+      - haproxy-net
+
+volumes:
+  ssh-tunnel-hostkeys:
+
+networks:
+  haproxy-net:
+    external: true

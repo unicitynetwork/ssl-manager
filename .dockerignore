@@ -1,0 +1,32 @@
+# Secrets and identity — NEVER send to Docker daemon
+.claude
+**/.env
+**/*.key
+**/identity.json
+**/settings.json
+**/settings.local.json
+
+# Git
+.git
+.gitignore
+
+# Documentation (not needed in images)
+*.md
+docs/
+CLAUDE.md
+README.md
+INTEGRATION.md
+
+# Host-side scripts (not needed in images)
+publish.sh
+run-lib.sh
+examples/
+
+# Node.js (rebuilt in Dockerfile)
+node_modules/
+tunnel-manager/node_modules/
+tunnel-daemon/node_modules/
+
+# Test files (not needed in production images)
+tunnel-manager/src/__tests__/
+tunnel-daemon/src/__tests__/

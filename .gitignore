@@ -1,0 +1,7 @@
+.claude
+node_modules/
+tunnel-manager/node_modules/
+tunnel-daemon/node_modules/
+
+# ssh-tunnel-endpoint developer keys (never commit) — keep only authorized_keys.example
+ssh-tunnel-endpoint/authorized_keys

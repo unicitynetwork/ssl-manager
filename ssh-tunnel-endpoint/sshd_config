@@ -1,0 +1,43 @@
+# staging-tunnel sshd — tunnel-only. Per-key limits live in authorized_keys
+# (restrict,port-forwarding,permitopen="haproxy:8404").
+Port 22
+
+# Host keys persisted in a volume (/etc/ssh/keys) so the client-pinned fingerprint
+# is stable across container restarts/recreations.
+HostKey /etc/ssh/keys/ssh_host_ed25519_key
+HostKey /etc/ssh/keys/ssh_host_rsa_key
+
+# Auth: public-key only.
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+UsePAM no
+AllowUsers tunnel
+
+# Forwarding: allow TCP forwarding (needed for -R and -L); let the client bind non-loopback
+# addresses (so `ssh -R 0.0.0.0:<port>` binds the container's haproxy-net interface, which
+# haproxy can reach). No tun devices, no agent/X11 forwarding, no shell/PTY.
+AllowTcpForwarding yes
+GatewayPorts clientspecified
+PermitTunnel no
+AllowAgentForwarding no
+X11Forwarding no
+PermitTTY no
+
+# Fail-CLOSED even if a key is added to authorized_keys WITHOUT the recommended
+# `restrict,port-forwarding,permitopen="haproxy:8404"` options (defence in depth):
+#  - ForceCommand: any shell/exec request runs /bin/false and the session ends; a
+#    `-N` port-forward-only session requests no command, so tunnels are unaffected.
+#  - PermitOpen: bound `-L` (direct-tcpip) targets to the Registration API for ALL
+#    keys — a mis-added key still cannot reach other haproxy-net services. (`-R` bind
+#    ports remain bounded by haproxy's ALLOWED_PORTS allowlist.)
+ForceCommand /bin/false
+PermitOpen haproxy:8404
+
+# Keepalive so dead tunnels are reaped.
+ClientAliveInterval 30
+ClientAliveCountMax 3
+
+LogLevel VERBOSE
