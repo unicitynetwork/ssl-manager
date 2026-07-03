@@ -28,12 +28,6 @@ import {
   verifyDockerDns,
   cleanupWgConfig,
 } from './wireguard.mjs';
-import {
-  checkSshAvailability,
-  establishSshTunnel,
-  killSshTunnel,
-  verifySshTunnel,
-} from './ssh-tunnel.mjs';
 
 const LOG_PREFIX = '[tunnel-manager]';
 
@@ -59,7 +53,6 @@ export class TunnelStateMachine {
     this.transport = null;
     this.serverIp = null;
     this.clientIp = null;
-    this.sshProcess = null;
     this.startedAt = null;
     this.reconnectCount = 0;
 
@@ -113,23 +106,15 @@ export class TunnelStateMachine {
     // ---- BOOTSTRAPPING ----
     this._setState(CLIENT_STATE.BOOTSTRAPPING);
 
-    // Check tunnel capability
-    if (this.config.tunnelMode === 'full') {
-      const wgCheck = checkWireGuardAvailability();
-      if (!wgCheck.available) {
-        err('WireGuard kernel module not found and wireguard-go not installed.');
-        err('Requires Linux 5.6+ or wireguard-go.');
-        return EXIT_CODES.TUNNEL_FAILED;
-      }
-      log(`WireGuard available via: ${wgCheck.method}`);
-    } else {
-      const sshCheck = checkSshAvailability();
-      if (!sshCheck.available) {
-        err('Neither autossh nor ssh found. Required for lite mode.');
-        return EXIT_CODES.TUNNEL_FAILED;
-      }
-      log(`SSH available via: ${sshCheck.method}`);
+    // Check tunnel capability. This DTNP client is WireGuard-only; the lightweight,
+    // negotiation-free SSH-reverse ("ssh-lite") mode lives in ../ssh-tunnel-client.
+    const wgCheck = checkWireGuardAvailability();
+    if (!wgCheck.available) {
+      err('WireGuard kernel module not found and wireguard-go not installed.');
+      err('Requires Linux 5.6+ or wireguard-go.');
+      return EXIT_CODES.TUNNEL_FAILED;
     }
+    log(`WireGuard available via: ${wgCheck.method}`);
 
     // Connect to Nostr relays
     try {
@@ -315,8 +300,6 @@ export class TunnelStateMachine {
 
     if (this.tunnelType === 'wireguard') {
       return await this._establishWireGuard(auth, haproxyApi);
-    } else if (this.tunnelType === 'ssh-reverse') {
-      return await this._establishSshReverse(auth, haproxyApi);
     } else {
       err(`Unsupported tunnel type: ${this.tunnelType}`);
       return EXIT_CODES.TUNNEL_FAILED;
@@ -396,42 +379,6 @@ export class TunnelStateMachine {
     await this.nostrClient.sendDM(this.config.remoteHaproxyId, established).catch(e => {
       warn(`Failed to send TUNNEL_ESTABLISHED: ${e.message}`);
     });
-
-    return EXIT_CODES.SUCCESS;
-  }
-
-  /**
-   * Establish SSH reverse tunnel (lite mode).
-   */
-  async _establishSshReverse(auth, haproxyApi) {
-    try {
-      this.sshProcess = establishSshTunnel(auth);
-    } catch (e) {
-      err(`SSH tunnel failed: ${e.message}`);
-      return EXIT_CODES.TUNNEL_FAILED;
-    }
-
-    // Wait briefly for the tunnel to establish
-    await sleep(3000);
-
-    // Verify ports are forwarded
-    if (!verifySshTunnel(auth.forwarded_ports || [])) {
-      warn('Some SSH forwarded ports are not accessible');
-    }
-
-    // Set IPs for env file
-    this.serverIp = haproxyApi?.host || auth.ssh_host;
-    this.clientIp = 'localhost'; // SSH -R, no VPN IP
-
-    // Send TUNNEL_ESTABLISHED
-    const established = buildTunnelEstablished(
-      this.correlationId,
-      this._nextSeq(),
-      this.identity.npub || '',
-      this.clientIp,
-      0
-    );
-    await this.nostrClient.sendDM(this.config.remoteHaproxyId, established).catch(() => {});
 
     return EXIT_CODES.SUCCESS;
   }
@@ -594,26 +541,6 @@ export class TunnelStateMachine {
       return EXIT_CODES.SUCCESS;
     }
 
-    // SSH mode: just restart the process
-    if (this.sshProcess) {
-      killSshTunnel(this.sshProcess);
-      await sleep(2000);
-      const auth = this.offer?.payload?.auth;
-      if (auth) {
-        try {
-          this.sshProcess = establishSshTunnel(auth);
-          await sleep(3000);
-          this._setState(CLIENT_STATE.ACTIVE);
-          this._startHealthCheck();
-          this._startHeartbeat();
-          this._reconnecting = false;
-          return EXIT_CODES.SUCCESS;
-        } catch (e) {
-          err(`SSH reconnect failed: ${e.message}`);
-        }
-      }
-    }
-
     this._reconnecting = false;
     return EXIT_CODES.TUNNEL_FAILED;
   }
@@ -651,8 +578,6 @@ export class TunnelStateMachine {
     if (this.tunnelType === 'wireguard') {
       wgDown();
       cleanupWgConfig();
-    } else if (this.sshProcess) {
-      killSshTunnel(this.sshProcess);
     }
 
     // Remove env file

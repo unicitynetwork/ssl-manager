@@ -22,7 +22,8 @@ export const MSG = {
 export const TUNNEL_TYPES = {
   WIREGUARD: 'wireguard',
   SSH_TUN: 'ssh-tun',
-  SSH_REVERSE: 'ssh-reverse',
+  // 'ssh-reverse' (inbound-only lite mode) retired from the DTNP client — it now lives,
+  // negotiation-free, in ../ssh-tunnel-client (+ ../ssh-tunnel-endpoint).
 };
 
 // Transport types
