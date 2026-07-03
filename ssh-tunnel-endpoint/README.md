@@ -94,8 +94,35 @@ not part of this component.
 - **Host keys** persist in the `ssh-tunnel-hostkeys` volume so the pinned fingerprint is
   stable across restarts.
 
+## Backup / restore the host key
+
+`hostkeys/` is the source of truth for the pinned fingerprint — **back it up** to a secure,
+gitignored secrets store (both the private keys and their `.pub` files):
+
+```bash
+cp -a hostkeys/. /path/to/secrets-backup/hostkeys/      # e.g. a gitignored .secrets/ store
+```
+
+**Restore** (host rebuild, disk loss, or moving the endpoint to another host) keeps the same
+fingerprint, so no client has to re-pin:
+
+```bash
+cp -a /path/to/secrets-backup/hostkeys/. hostkeys/
+TUNNEL_SSH_PORT=2222 docker compose up -d --build
+ssh-keyscan -p 2222 <public-host> | ssh-keygen -lf -    # confirm the pin is unchanged
+```
+
+To capture an **already-deployed** fingerprint that was auto-generated into the volume
+(before you adopted `hostkeys/`), copy the live key out first, then it becomes stable:
+
+```bash
+docker cp <container>:/etc/ssh/keys/. hostkeys/
+```
+
 ## Rotate / revoke
 
 - Revoke a host: delete its line from `authorized_keys`, `docker compose restart`.
-- Rotate host key: `docker volume rm ssh-tunnel-endpoint_ssh-tunnel-hostkeys` then restart
-  (re-distribute the new pin).
+- Rotate the host key: replace `hostkeys/` with a freshly generated key (or `rm -rf hostkeys/`
+  to fall back to auto-generate + `docker volume rm ssh-tunnel-endpoint_ssh-tunnel-hostkeys`),
+  then `docker compose up -d --build`. Rotating **invalidates every client's current pin** —
+  re-distribute the new `SHA256:…` fingerprint.
