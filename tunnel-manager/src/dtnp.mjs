@@ -52,9 +52,9 @@ export function buildTunnelRequest(config, identity, wgKeys) {
     }
   }
 
-  const tunnelPref = config.tunnelMode === 'lite'
-    ? ['ssh-reverse']
-    : ['wireguard', 'ssh-tun'];
+  // WireGuard-only DTNP client (the 'ssh-reverse' lite mode is retired — see
+  // ../ssh-tunnel-client). 'ssh-tun' remains as the declared WireGuard L3 fallback.
+  const tunnelPref = ['wireguard', 'ssh-tun'];
 
   const transportPref = config.tunnelTransport === 'auto'
     ? ['auto', 'udp', 'wss']

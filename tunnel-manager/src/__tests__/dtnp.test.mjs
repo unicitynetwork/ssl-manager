@@ -56,22 +56,6 @@ describe('DTNP Message Builder', () => {
     assert.ok(msg.correlation_id);
   });
 
-  it('builds a TUNNEL_REQUEST in lite mode', () => {
-    const config = {
-      sslDomain: 'test.example.com',
-      sslDomainAliases: [],
-      sslHttpsPort: 443,
-      sslAliasProxyPort: 8444,
-      extraPorts: [],
-      tunnelMode: 'lite',
-      tunnelTransport: 'auto',
-      tunnelRelayUrls: [],
-    };
-
-    const msg = buildTunnelRequest(config, { npub: '' }, { publicKey: '' });
-    assert.deepEqual(msg.payload.tunnel_preference, ['ssh-reverse']);
-  });
-
   it('builds a TUNNEL_ACCEPT', () => {
     const msg = buildTunnelAccept('corr-123', 2, 'npub1test', 'wireguard', 'udp');
 

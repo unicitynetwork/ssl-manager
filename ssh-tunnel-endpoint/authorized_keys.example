@@ -1,0 +1,16 @@
+# staging-tunnel authorized_keys — one line per developer.
+#
+# Copy to `authorized_keys` (gitignored) and add real keys. Lock every key to
+# tunnel-only + the Registration API with these options:
+#
+#   restrict          disable pty / agent / X11 / user-rc — enable ONLY what we add back
+#   port-forwarding   re-enable -R (reverse tunnel) and -L (Registration API forward)
+#   permitopen="haproxy:8404"
+#                     limit -L destinations to the haproxy Registration API only
+#
+# (Reverse-tunnel bind ports are bounded by the haproxy ALLOWED_PORTS allowlist — a bound
+#  port that no domain is registered to is inert — so an explicit permitlisten range,
+#  which OpenSSH can't express, is not required.)
+#
+# Example (replace the key + comment):
+# restrict,port-forwarding,permitopen="haproxy:8404" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... alice@laptop

@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node src/index.mjs",
-    "test": "node --test src/__tests__/"
+    "test": "node --test src/__tests__/*.test.mjs"
   },
   "dependencies": {
     "@noble/secp256k1": "^2.0.0",

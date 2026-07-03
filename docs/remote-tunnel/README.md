@@ -32,4 +32,18 @@ Once the tunnel is established, the existing ssl-setup flow runs unchanged — c
 - [x] Architecture design
 - [x] Protocol specification (DTNP v0.1)
 - [x] Tunneling technology comparison
-- [ ] Implementation (not started)
+- [~] **Full mode (WireGuard + DTNP/Nostr)** — `tunnel-daemon/` (server) + `tunnel-manager/`
+  (client). WireGuard path built; unit-tested; not yet verified end-to-end.
+- [x] **Lite mode (SSH `-R`, inbound-only)** — **implemented and verified live**, but as a
+  standalone, **negotiation-free** realization (no Nostr/DTNP): [`ssh-tunnel-endpoint/`](../../ssh-tunnel-endpoint)
+  (restricted sshd on `haproxy-net`) + [`ssh-tunnel-client/`](../../ssh-tunnel-client)
+  (a dependency-free shell client). It talks to the haproxy Registration API directly over an
+  SSH `-L` forward. The DTNP client's earlier SSH-reverse stub (`tunnel-manager/src/ssh-tunnel.mjs`)
+  was retired in favor of it; the DTNP client is now WireGuard-only.
+
+> **Two realizations of the lite mode.** The DTNP design negotiates transports over Nostr and
+> was to select `ssh-reverse` for lite mode. In practice the daemon only ever offered
+> WireGuard, so the negotiated SSH path never worked. The standalone `ssh-tunnel-*` components
+> deliver the same inbound-only capability today without the negotiation layer — the pragmatic
+> choice for "just expose this firewalled http/https service." A future DTNP integration could
+> negotiate *either* transport and hand off to the same endpoint.
