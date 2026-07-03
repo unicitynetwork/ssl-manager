@@ -40,35 +40,40 @@ not part of this component.
 
    `authorized_keys` is gitignored — never commit it.
 
-2. **Start the endpoint** (host port `2022` is often taken — override with `TUNNEL_SSH_PORT`):
+2. **Provide a stable host key** (recommended). Generate once into the gitignored
+   `hostkeys/` dir; the entrypoint installs it authoritatively on every start, so the
+   fingerprint clients pin survives `docker compose down -v`, volume loss, and redeploys on
+   another host. Skip this and the container auto-generates a key into its volume instead —
+   stable across restarts, but a **new fingerprint** if the volume is ever recreated (which
+   re-pins every client).
+
+   ```bash
+   mkdir -p hostkeys
+   ssh-keygen -t ed25519 -N '' -f hostkeys/ssh_host_ed25519_key
+   ssh-keygen -t rsa   -b 3072 -N '' -f hostkeys/ssh_host_rsa_key
+   ```
+
+   `hostkeys/` is gitignored — **back it up**, never commit it. (To keep an already-deployed
+   fingerprint, copy the running key out first: `docker cp <name>:/etc/ssh/keys/. hostkeys/`.)
+
+3. **Start the endpoint** (host port `2022` is often taken — override with `TUNNEL_SSH_PORT`):
 
    ```bash
    TUNNEL_SSH_PORT=2222 docker compose up -d --build
-   docker logs staging-tunnel | grep -A1 fingerprint   # copy the SHA256:... host-key pin
+   ```
+
+   Then read the **host-key** fingerprint to distribute as the pin. Do NOT `tail` the logs
+   for `SHA256:` — sshd runs verbose and also logs *client* key fingerprints on connect. Use:
+
+   ```bash
+   docker logs staging-tunnel | grep -A1 'endpoint host key fingerprint'   # the startup line
+   # or authoritatively, exactly what a client pins:
+   ssh-keyscan -p 2222 <public-host> | ssh-keygen -lf -
    ```
 
    Give each remote host: the public host + ssh port, the `SHA256:…` fingerprint, and its key.
    The `container_name` (haproxy-net alias haproxy routes to) defaults to `staging-tunnel`;
    override with `TUNNEL_ENDPOINT_NAME` and have clients set `TUNNEL_ENDPOINT_ALIAS` to match.
-
-## Stable host key
-
-For a **stable, reproducible** fingerprint that survives volume loss (and is identical
-across hosts), provide the host key instead of letting the container auto-generate one:
-
-```bash
-# generate once (or reuse an existing key) into the gitignored hostkeys/ dir
-mkdir -p hostkeys
-ssh-keygen -t ed25519 -N '' -f hostkeys/ssh_host_ed25519_key
-ssh-keygen -t rsa -b 3072 -N '' -f hostkeys/ssh_host_rsa_key
-docker compose up -d --build       # entrypoint installs hostkeys/ (authoritative)
-```
-
-`hostkeys/` is gitignored — **back it up**, never commit it. When present it is used on
-every start, so `docker compose down -v` / a wiped volume / a redeploy on another host all
-keep the same `SHA256:…` pin. Without a `hostkeys/` dir the entrypoint falls back to
-generating into the persistent volume (stable across restarts, but a new fingerprint if the
-volume is ever recreated).
 
 ## Security model
 
