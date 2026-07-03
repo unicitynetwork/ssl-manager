@@ -12,6 +12,14 @@ import {
 } from '../dtnp.mjs';
 import { MSG, DTNP_VERSION } from '../constants.mjs';
 
+// validateEnvelope also validates the payload per message type, so envelope-level tests
+// (structure / version) must supply a payload that passes validateTunnelRequestPayload.
+const VALID_REQUEST_PAYLOAD = {
+  primary_domain: 'test.example.com',
+  client_wg_pubkey: 'A'.repeat(43) + '=', // 44-char base64, matches WG_PUBKEY_RE
+  ports: [],
+};
+
 describe('DTNP Message Builder', () => {
   it('creates a valid envelope', () => {
     const env = createEnvelope(MSG.TUNNEL_REQUEST, { test: true }, {
@@ -109,7 +117,7 @@ describe('DTNP Message Builder', () => {
 
 describe('DTNP Message Validator', () => {
   it('accepts a valid envelope', () => {
-    const env = createEnvelope(MSG.TUNNEL_REQUEST, { test: true }, {
+    const env = createEnvelope(MSG.TUNNEL_REQUEST, VALID_REQUEST_PAYLOAD, {
       correlationId: 'test-id',
       sequence: 1,
     });
@@ -151,14 +159,14 @@ describe('DTNP Message Validator', () => {
   });
 
   it('accepts version with same major, different minor', () => {
-    const env = createEnvelope(MSG.TUNNEL_REQUEST, {}, { correlationId: 'x', sequence: 1 });
+    const env = createEnvelope(MSG.TUNNEL_REQUEST, VALID_REQUEST_PAYLOAD, { correlationId: 'x', sequence: 1 });
     env.dtnp_version = '0.2.0'; // minor bump OK
     assert.equal(validateEnvelope(env).valid, true);
   });
 
   it('rejects version with different major', () => {
-    const env = createEnvelope(MSG.TUNNEL_REQUEST, {}, { correlationId: 'x', sequence: 1 });
-    env.dtnp_version = '1.0.0'; // major bump NOT OK
+    const env = createEnvelope(MSG.TUNNEL_REQUEST, VALID_REQUEST_PAYLOAD, { correlationId: 'x', sequence: 1 });
+    env.dtnp_version = '1.0.0'; // major bump NOT OK (valid payload, so ONLY the version is under test)
     assert.equal(validateEnvelope(env).valid, false);
   });
 });
