@@ -80,7 +80,7 @@ Started by ssl-setup after initial certificate acquisition. Runs as a background
 
 - Waits 1 hour before first check.
 - Runs `certbot renew` every ~12 hours with random jitter (0-30 minutes).
-- Uses `--deploy-hook "touch /tmp/.ssl-renewal-restart"` so the app's supervisor loop can detect renewal and restart.
+- Uses `--deploy-hook "/usr/local/bin/ssl-renewal-hook"`, which touches `/tmp/.ssl-renewal-restart` (for marker-watching supervisors) and runs `$SSL_RELOAD_CMD` if set (so apps without a watcher still reload the renewed cert).
 - In `SSL_TEST_MODE`, sleeps indefinitely (self-signed certs do not need renewal).
 
 ### haproxy-register.sh (API Client)
@@ -124,8 +124,8 @@ Registration happens in two phases: first HTTP-only (for certbot validation), th
 ### Certificate Lifecycle
 
 1. **Acquisition:** ssl-setup obtains the initial certificate (certbot or self-signed).
-2. **Renewal:** ssl-renew checks every ~12 hours and runs `certbot renew`. On success, touches `/tmp/.ssl-renewal-restart`.
-3. **Rotation:** The app's supervisor loop detects the restart marker, re-sources `/tmp/.ssl-env`, and restarts the app process to load the new certificate.
+2. **Renewal:** ssl-renew checks every ~12 hours and runs `certbot renew`. On success, the deploy hook `ssl-renewal-hook` touches `/tmp/.ssl-renewal-restart` and runs `$SSL_RELOAD_CMD` if set.
+3. **Rotation:** Either the app's supervisor loop detects the restart marker (re-sources `/tmp/.ssl-env`, restarts the app), or `SSL_RELOAD_CMD` reloads the app directly. Without one of these, the renewed cert on disk is never loaded and the app keeps serving the old/expired cert.
 
 ## Integration Pattern
 
