@@ -697,6 +697,7 @@ Key patterns from the Fulcrum integration:
 | `SSL_STAGING` | _(empty)_ | Set to `true` to use Let's Encrypt staging environment (test certificates that browsers reject, but no rate limits). |
 | `SSL_TEST_MODE` | _(empty)_ | Set to `true` to generate a self-signed certificate instead of using certbot. For development and CI only. |
 | `SSL_SKIP_VERIFY` | `false` | Set to `true` to skip the TLS verification step after certificate acquisition. |
+| `SSL_RELOAD_CMD` | _(empty)_ | Command run by the renewal deploy hook (`ssl-renewal-hook`) after each successful renewal, so your app reloads the new cert without a marker-watcher. Must be self-resolving (e.g. `pkill -HUP -x myapp`); runs in the renewal process tree, not your app's. The marker `/tmp/.ssl-renewal-restart` is touched regardless. |
 
 ### HAProxy Configuration
 
@@ -872,11 +873,13 @@ After ssl-setup completes, it starts `/usr/local/bin/ssl-renew` as a background 
 
 1. Waits 1 hour after container startup (to avoid renewal checks during initial configuration).
 2. Runs `certbot renew` every ~12 hours (with random jitter of 0--30 minutes to avoid thundering herd).
-3. Uses certbot's `--deploy-hook` to touch `/tmp/.ssl-renewal-restart` when a certificate is actually renewed.
+3. Uses certbot's `--deploy-hook` to run `/usr/local/bin/ssl-renewal-hook` when a certificate
+   is actually renewed. That hook (a) touches `/tmp/.ssl-renewal-restart` for marker-watching
+   consumers and (b) runs `$SSL_RELOAD_CMD` if set.
 
 ### What Your App Needs to Do
 
-When a certificate is renewed, the cert files on disk are updated, but your application is still using the old certificate in memory. You need to reload the certificate. There are two approaches:
+When a certificate is renewed, the cert files on disk are updated, but your application is still using the old certificate in memory. **You must reload the certificate — nothing reloads it for you automatically unless you opt in.** A long-running app that loaded its cert at startup and does neither of the below will keep serving the old cert until it expires (this has caused production outages). Pick **one** approach:
 
 **Approach 1: Watch the restart marker (recommended for long-running processes)**
 
@@ -902,13 +905,26 @@ while true; do
 done
 ```
 
-**Approach 2: Application-level reload (if your app supports it)**
+> **Footgun:** check the marker on a **timer** (as above), not only after your app process
+> exits. A supervisor that only inspects the marker after `wait "$APP_PID"` returns never
+> sees it while the app runs normally — so a stable app never reloads. Check every loop
+> iteration regardless of app state.
 
-Some applications (e.g., nginx, HAProxy) can reload certificates without restart. In this case, you can add a certbot deploy hook that triggers the reload:
+**Approach 2: `SSL_RELOAD_CMD` (simplest — no watcher needed)**
+
+Set `SSL_RELOAD_CMD` and the renewal deploy hook runs it for you on every renewal (the
+marker is still touched too). Use a **self-resolving** command — it runs in the renewal
+process tree, not your app's, so it cannot see a PID your app exported after startup:
 
 ```bash
-certbot renew --deploy-hook "kill -HUP $(cat /var/run/myapp.pid)"
+# reload-capable app (nginx/HAProxy-style):
+-e SSL_RELOAD_CMD='pkill -HUP -x myapp'
+# or restart-via-supervisor using a pidfile your app writes:
+-e SSL_RELOAD_CMD='kill -TERM "$(cat /run/myapp.pid)"'
 ```
+
+This is the recommended option for apps that do not already have a marker-watching
+supervisor, and it is what prevents the "renewed-but-never-reloaded → expired cert" outage.
 
 ### Self-Signed Mode
 
