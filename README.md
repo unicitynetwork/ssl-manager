@@ -178,6 +178,23 @@ A background loop runs every ~12 hours and calls `certbot renew`. When a certifi
 | `HAPROXY_API_KEY` | No | (empty) | Bearer token for HAProxy API authentication |
 | `APP_HTTP_PORT` | No | `0` | Your app's HTTP port behind the proxy. `0` = disabled |
 | `EXTRA_PORTS` | No | (empty) | JSON array of extra port mappings for HAProxy |
+| `SSL_PROXY_PROTOCOL` | No | `v2` | Accept PROXY protocol v2 from haproxy and register for it (`off` opts out; default `off` in remote tunnel mode). See "Real client IPs" below. |
+| `SSL_PROXY_TRUSTED_CIDRS` | No | `auto` | Peers allowed to send a PROXY header: `auto` = haproxy-net subnet, `haproxy` = only the haproxy host (strict), or CIDR/IP list. Headers from anyone else close the connection. |
+| `SSL_PROXY_HTTPS_PORT` | No | `8445` | Port of the PROXY-aware TLS shim haproxy's :443 passthrough is routed to (forwards to `SSL_HTTPS_PORT`). |
+| `SSL_PROXY_HTTPS_UPSTREAM` | No | `auto:$SSL_HTTPS_PORT` | Shim upstream; `auto` = this container's own non-loopback IP. |
+| `SSL_PROXY_HTTPS_UPSTREAM_PROTOCOL` | No | `none` | `v2`/`v1`: shim re-emits the real client address to the app as a PROXY header (point the upstream at a dedicated PROXY listener of the app). |
+| `SSL_PROXY_LOG_CONNECTIONS` | No | `false` | Log the real client address of each shim connection. |
+
+### Real client IPs (PROXY protocol v2)
+
+Since the `proxy-protocol-v2-default` release, a container registers with haproxy using `"proxy_protocol":"v2"`. haproxy then prepends a PROXY v2 header. Full design: haproxy repo `docs/PROXY-PROTOCOL-V2-DESIGN.md`.
+
+- **HTTP (:80):** `ssl-http-proxy` reads the header and **overwrites** `X-Forwarded-For` and `X-Real-IP` with the real client address. Client-supplied values are discarded. Read `X-Real-IP` (or the single XFF value) in your app.
+- **TLS (:443 passthrough):** haproxy sends to the shim on `SSL_PROXY_HTTPS_PORT` (8445). The shim forwards the untouched TLS stream to your `SSL_HTTPS_PORT`. Your app sees the shim's (container) address. For your app to see the client, give it a PROXY listener and set the two upstream variables. nginx example:
+  `listen 8446 ssl proxy_protocol; set_real_ip_from <container-ip>/32; real_ip_header proxy_protocol;` together with `SSL_PROXY_HTTPS_UPSTREAM=auto:8446` and `SSL_PROXY_HTTPS_UPSTREAM_PROTOCOL=v2`.
+- **Extra ports:** these are untouched by default. Add `"proxy_protocol":"v2"` to an `EXTRA_PORTS` entry only if that listener parses PROXY v2.
+- **Unchanged paths:** direct connections without a header still work, including health checks, container-to-container calls, and `localhost`.
+- **Rollback safety:** the header is optional on every ssl-manager listener. If haproxy stops sending it, the container keeps working.
 
 ## Provided Scripts
 
