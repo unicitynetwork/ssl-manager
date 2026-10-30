@@ -12,7 +12,7 @@ Configuration via CLI args and environment variables.
 
 PROXY protocol v2 (SSL_PROXY_PROTOCOL, default "v2"): a connection may start with
 a PROXY v2 header. It is honoured only when the TCP peer is trusted
-(SSL_PROXY_TRUSTED_CIDRS, default "auto" = the haproxy-net subnet); a header from
+(SSL_PROXY_TRUSTED_CIDRS, default "haproxy" = only the haproxy container; "auto" = the haproxy-net subnet); a header from
 an untrusted peer closes the connection. Connections without a header are served
 as before (local health checks, container-to-container calls). When a header was
 honoured, X-Forwarded-For and X-Real-IP sent upstream are OVERWRITTEN with the

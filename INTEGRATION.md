@@ -707,7 +707,7 @@ Key patterns from the Fulcrum integration:
 | `HAPROXY_API_KEY` | _(empty)_ | Bearer token for API authentication. Sent as `Authorization: Bearer <key>`. |
 | `EXTRA_PORTS` | _(empty)_ | JSON array of extra port mappings for HAProxy. Each entry: `{"listen": <int>, "target": <int>, "mode": "tcp"|"http", "proxy_protocol"?: "v2"|"none"}`. |
 | `SSL_PROXY_PROTOCOL` | `v2` | Accept PROXY protocol v2 from haproxy and register for it (`off` opts out; default `off` in remote tunnel mode). See "Real client IPs" below. |
-| `SSL_PROXY_TRUSTED_CIDRS` | `auto` | Peers allowed to send a PROXY header: `auto` = haproxy-net subnet, `haproxy` = only the haproxy host (strict), or CIDR/IP list. Headers from anyone else close the connection. |
+| `SSL_PROXY_TRUSTED_CIDRS` | `haproxy` | Peers allowed to send a PROXY header: `haproxy` = only the haproxy host (default, strict), `auto` = haproxy-net subnet, or CIDR/IP list. Headers from anyone else close the connection. |
 | `SSL_PROXY_HTTPS_PORT` | `8445` | Port of the PROXY-aware TLS shim haproxy's :443 passthrough is routed to (forwards to `SSL_HTTPS_PORT`). |
 | `SSL_PROXY_HTTPS_UPSTREAM` | `auto:$SSL_HTTPS_PORT` | Shim upstream; `auto` = this container's own non-loopback IP. |
 | `SSL_PROXY_HTTPS_UPSTREAM_PROTOCOL` | `none` | `v2`/`v1`: shim re-emits the real client address to the app as a PROXY header (point the upstream at a dedicated PROXY listener of the app). |

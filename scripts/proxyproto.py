@@ -360,7 +360,7 @@ class TrustPolicy:
 
 def policy_from_env(env=os.environ) -> TrustPolicy:
     return TrustPolicy(
-        spec=env.get("SSL_PROXY_TRUSTED_CIDRS", "auto"),
+        spec=env.get("SSL_PROXY_TRUSTED_CIDRS", "haproxy"),
         haproxy_host=env.get("HAPROXY_HOST") or "haproxy",
     )
 

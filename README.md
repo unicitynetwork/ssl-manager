@@ -179,7 +179,7 @@ A background loop runs every ~12 hours and calls `certbot renew`. When a certifi
 | `APP_HTTP_PORT` | No | `0` | Your app's HTTP port behind the proxy. `0` = disabled |
 | `EXTRA_PORTS` | No | (empty) | JSON array of extra port mappings for HAProxy |
 | `SSL_PROXY_PROTOCOL` | No | `v2` | Accept PROXY protocol v2 from haproxy and register for it (`off` opts out; default `off` in remote tunnel mode). See "Real client IPs" below. |
-| `SSL_PROXY_TRUSTED_CIDRS` | No | `auto` | Peers allowed to send a PROXY header: `auto` = haproxy-net subnet, `haproxy` = only the haproxy host (strict), or CIDR/IP list. Headers from anyone else close the connection. |
+| `SSL_PROXY_TRUSTED_CIDRS` | No | `haproxy` | Peers allowed to send a PROXY header: `haproxy` = only the haproxy host (default, strict), `auto` = haproxy-net subnet, or CIDR/IP list. Headers from anyone else close the connection. |
 | `SSL_PROXY_HTTPS_PORT` | No | `8445` | Port of the PROXY-aware TLS shim haproxy's :443 passthrough is routed to (forwards to `SSL_HTTPS_PORT`). |
 | `SSL_PROXY_HTTPS_UPSTREAM` | No | `auto:$SSL_HTTPS_PORT` | Shim upstream; `auto` = this container's own non-loopback IP. |
 | `SSL_PROXY_HTTPS_UPSTREAM_PROTOCOL` | No | `none` | `v2`/`v1`: shim re-emits the real client address to the app as a PROXY header (point the upstream at a dedicated PROXY listener of the app). |
