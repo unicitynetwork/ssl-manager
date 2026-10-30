@@ -9,6 +9,14 @@ Listens on port 80 and routes requests:
   /*                             -> reverse proxy to upstream app
 
 Configuration via CLI args and environment variables.
+
+PROXY protocol v2 (SSL_PROXY_PROTOCOL, default "v2"): a connection may start with
+a PROXY v2 header. It is honoured only when the TCP peer is trusted
+(SSL_PROXY_TRUSTED_CIDRS, default "auto" = the haproxy-net subnet); a header from
+an untrusted peer closes the connection. Connections without a header are served
+as before (local health checks, container-to-container calls). When a header was
+honoured, X-Forwarded-For and X-Real-IP sent upstream are OVERWRITTEN with the
+real client address (any client-supplied values are dropped).
 """
 
 import argparse
@@ -19,9 +27,14 @@ import os
 import socket
 import subprocess
 import threading
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+sys.path.insert(0, "/usr/local/lib/ssl-manager")
+sys.path.insert(1, os.path.dirname(os.path.abspath(__file__)))
+import proxyproto as pp  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +56,13 @@ READ_TIMEOUT = 30
 
 # Reserved ports that APP_HTTP_PORT must not use
 RESERVED_PORTS = {80, 8404}
+
+# PROXY protocol (configured in main)
+PP_HEADER_TIMEOUT = float(os.environ.get("SSL_PROXY_HEADER_TIMEOUT", "5"))
+PP_MAX_HEADER = int(os.environ.get("SSL_PROXY_MAX_HEADER", pp.DEFAULT_MAX_PAYLOAD))
+_pp_enabled = False
+_pp_policy = None
+_pp_log = pp.RateLimitedLog(lambda m: print(f"ssl-http-proxy: WARNING: {m}", file=sys.stderr, flush=True))
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +128,80 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     # Suppress default request logging (too noisy for health checks)
     def log_message(self, format, *args):
         pass
+
+    # -- PROXY protocol --
+
+    def setup(self):
+        self.pp_info = None
+        self.pp_rejected = False
+        self.peer_ip = pp.normalize_ip(self.client_address[0])
+        if _pp_enabled:
+            try:
+                self._consume_proxy_header()
+            except (OSError, ValueError) as e:
+                self.pp_rejected = True
+                _pp_log("conn", f"PROXY header read failed from {self.peer_ip}: {e}")
+        super().setup()
+
+    def _consume_proxy_header(self):
+        """Peek at the socket; if it starts with a PROXY v2 header from a trusted
+        peer, consume it and adopt the client address. Never blocks the accept
+        loop (runs in the per-connection thread) and is bounded by a timeout."""
+        sock = self.request
+        old_timeout = sock.gettimeout()
+        deadline = time.monotonic() + PP_HEADER_TIMEOUT
+        data = b""
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    if len(data) < pp.SIG_LEN:
+                        return  # a short non-header prefix (e.g. a stray CRLF): plain HTTP
+                    raise ValueError("timeout inside PROXY header")
+                sock.settimeout(remaining)
+                try:
+                    data = sock.recv(pp.FIXED_LEN + PP_MAX_HEADER, socket.MSG_PEEK)
+                except socket.timeout:
+                    return  # nothing sent yet: let the HTTP layer time out as before
+                if not data:
+                    return  # EOF (e.g. TCP connect-only health probe)
+                if len(data) >= pp.SIG_LEN and data[:pp.SIG_LEN] == pp.SIGNATURE \
+                        and not _pp_policy.is_trusted(self.peer_ip):
+                    self.pp_rejected = True
+                    _pp_log("reject", f"PROXY header from UNTRUSTED peer {self.peer_ip} rejected")
+                    return
+                state, val = pp.classify(data, PP_MAX_HEADER)
+                if state == pp.NOT_PROXY:
+                    return
+                if state == pp.INVALID:
+                    self.pp_rejected = True
+                    _pp_log("invalid", f"invalid PROXY header from {self.peer_ip}: {val}")
+                    return
+                if state == pp.PROXY:
+                    if not _pp_policy.is_trusted(self.peer_ip):
+                        self.pp_rejected = True
+                        _pp_log("reject", f"PROXY header from UNTRUSTED peer {self.peer_ip} rejected")
+                        return
+                    need = val.header_len
+                    while need > 0:  # consume exactly the header
+                        got = sock.recv(need)
+                        if not got:
+                            raise ValueError("EOF inside PROXY header")
+                        need -= len(got)
+                    self.pp_info = val
+                    if val.src_ip:
+                        self.client_address = (val.src_ip, val.src_port)
+                    return
+                # NEED_MORE: the rest of the header is in flight
+                time.sleep(0.01)
+        finally:
+            sock.settimeout(old_timeout)
+
+    def handle(self):
+        if self.pp_rejected:
+            self.close_connection = True
+            return
+        super().handle()
 
     def _parse_upstream(self) -> tuple[str, int]:
         """Parse upstream host:port from config."""
@@ -240,11 +334,20 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         body = self.rfile.read(content_length) if content_length > 0 else None
 
+        # Real client address known from a trusted PROXY header?
+        pp_client = self.pp_info.src_ip if getattr(self, "pp_info", None) else None
+
         # Build forwarded headers
         forwarded_headers = {}
         for key, value in self.headers.items():
             # Skip hop-by-hop headers
             lower = key.lower()
+            # Forwarding headers are (re)computed below. Match case-insensitively:
+            # haproxy forwards header names lower-cased, so a client-supplied
+            # "x-forwarded-for" would otherwise survive NEXT TO ours and, being
+            # first, win in the app (spoofable first-hop).
+            if lower in ("x-forwarded-for", "x-real-ip", "x-forwarded-host", "x-forwarded-proto"):
+                continue
             if lower in (
                 "connection",
                 "keep-alive",
@@ -259,12 +362,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             forwarded_headers[key] = value
 
         # Add/update forwarding headers
-        client_ip = self.client_address[0]
-        existing_xff = self.headers.get("X-Forwarded-For", "")
-        if existing_xff:
-            forwarded_headers["X-Forwarded-For"] = f"{existing_xff}, {client_ip}"
-        else:
+        client_ip = pp.normalize_ip(self.client_address[0])
+        if pp_client:
+            # haproxy told us (PROXY v2) who the client is: that is the only truth.
             forwarded_headers["X-Forwarded-For"] = client_ip
+        else:
+            # Direct connection (no PROXY header): legacy append semantics.
+            existing_xff = self.headers.get("X-Forwarded-For", "")
+            if existing_xff:
+                forwarded_headers["X-Forwarded-For"] = f"{existing_xff}, {client_ip}"
+            else:
+                forwarded_headers["X-Forwarded-For"] = client_ip
+        forwarded_headers["X-Real-IP"] = client_ip
 
         forwarded_headers["X-Forwarded-Host"] = self.headers.get(
             "Host", f"localhost:{_config.get('port', 80)}"
@@ -463,6 +572,12 @@ def main():
         )
         raise SystemExit(1)
 
+    global _pp_enabled, _pp_policy
+    _pp_enabled = pp.pp_enabled_from_env()
+    if _pp_enabled:
+        _pp_policy = pp.policy_from_env()
+        _pp_policy.refresh_now()
+
     _config = {
         "port": args.port,
         "webroot": args.webroot,
@@ -474,7 +589,8 @@ def main():
         f"ssl-http-proxy: listening on :{args.port}, "
         f"upstream={args.upstream}, "
         f"webroot={args.webroot}, "
-        f"cert_dir={cert_dir or '(none)'}",
+        f"cert_dir={cert_dir or '(none)'}, "
+        f"proxy_protocol={'v2 (trusted: ' + _pp_policy.describe() + ')' if _pp_enabled else 'off'}",
         flush=True,
     )
 

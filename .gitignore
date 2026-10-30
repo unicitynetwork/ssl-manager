@@ -8,3 +8,4 @@ ssh-tunnel-endpoint/authorized_keys
 
 # ssh-tunnel-endpoint host keys (operator-provided, stable fingerprint) — never commit
 ssh-tunnel-endpoint/hostkeys/
+__pycache__/

@@ -30,3 +30,4 @@ tunnel-daemon/node_modules/
 # Test files (not needed in production images)
 tunnel-manager/src/__tests__/
 tunnel-daemon/src/__tests__/
+tests/
