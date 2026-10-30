@@ -186,27 +186,34 @@ if [[ "$PP_MODE" == "v2" ]]; then
         warn "Invalid SSL_PROXY_HTTPS_PORT='${SSL_PROXY_HTTPS_PORT}' -- PROXY protocol DISABLED"
         PP_MODE="none"
     else
-        case "$SSL_PROXY_HTTPS_PORT" in
-            80|8404|8443|8444|8000|"$SSL_HTTPS_PORT"|"$APP_HTTP_PORT")
-                warn "SSL_PROXY_HTTPS_PORT=${SSL_PROXY_HTTPS_PORT} collides with a port in use (80, 8000, 8404, 8443, 8444, SSL_HTTPS_PORT, APP_HTTP_PORT) -- PROXY protocol DISABLED; set SSL_PROXY_HTTPS_PORT to a free port"
-                PP_MODE="none" ;;
-        esac
+        # Ports the shim must not take: ours, the app's, and every EXTRA_PORTS target.
+        _pp_taken=" 80 8404 8443 8444 8000 ${SSL_HTTPS_PORT} ${APP_HTTP_PORT} "
+        if [[ -n "${EXTRA_PORTS:-}" && "${EXTRA_PORTS}" != "null" ]]; then
+            _pp_taken+="$(echo "$EXTRA_PORTS" | jq -r '.[]?.target? // empty' 2>/dev/null | tr '\n' ' ') "
+        fi
+        if [[ "$_pp_taken" == *" ${SSL_PROXY_HTTPS_PORT} "* ]]; then
+            warn "SSL_PROXY_HTTPS_PORT=${SSL_PROXY_HTTPS_PORT} collides with a port in use (80, 8000, 8404, 8443, 8444, SSL_HTTPS_PORT, APP_HTTP_PORT or an EXTRA_PORTS target) -- PROXY protocol DISABLED; set SSL_PROXY_HTTPS_PORT to a free port"
+            PP_MODE="none"
+        fi
     fi
 fi
 # ssl-http-proxy / ssl-pp-proxy read this from the environment
 if [[ "$PP_MODE" == "v2" ]]; then export SSL_PROXY_PROTOCOL=v2; else export SSL_PROXY_PROTOCOL=off; fi
 if [[ "$PP_MODE" == "v2" ]]; then
-    log "PROXY protocol v2: enabled (trusted sources: ${SSL_PROXY_TRUSTED_CIDRS:-auto}; TLS shim port ${SSL_PROXY_HTTPS_PORT} -> app ${SSL_HTTPS_PORT})"
+    log "PROXY protocol v2: enabled (trusted sources: ${SSL_PROXY_TRUSTED_CIDRS:-haproxy}${SSL_PROXY_HAPROXY_ADDR:+ + pinned ${SSL_PROXY_HAPROXY_ADDR}}; TLS shim port ${SSL_PROXY_HTTPS_PORT} -> app ${SSL_HTTPS_PORT})"
 else
     log "PROXY protocol: off (SSL_PROXY_PROTOCOL=${SSL_PROXY_PROTOCOL})"
 fi
 # What we register; may be downgraded to none below if the TLS shim cannot start.
 PP_REG_MODE="$PP_MODE"
 HTTPS_PROXY_PORT_REG="null"
+# The state file (read by haproxy-register) is written ONLY once the shim
+# readiness decision is made (step 6a). Drop any copy left in /tmp by a previous
+# boot of this container so a re-announce in between cannot claim v2.
 write_pp_state() {
     printf 'SSL_PP_REGISTERED_MODE=%s\nSSL_PP_HTTPS_PROXY_PORT=%s\n' "$PP_REG_MODE" "$HTTPS_PROXY_PORT_REG" > "$PP_STATE_FILE"
 }
-write_pp_state
+rm -f "$PP_STATE_FILE"
 
 # Parse domain aliases into an array
 ALL_SSL_DOMAINS=("$SSL_DOMAIN")
@@ -688,6 +695,7 @@ if [[ -n "$HAPROXY_DETECTED" ]]; then
             _shim_ready=false
             for _ in $(seq 1 20); do
                 if nc -z localhost "$SSL_PROXY_HTTPS_PORT" 2>/dev/null; then _shim_ready=true; break; fi
+                kill -0 "$PP_SHIM_PID" 2>/dev/null || break   # wrapper gave up (config error, exit 2)
                 sleep 0.25
             done
             if [[ "$_shim_ready" == "true" ]]; then
@@ -700,8 +708,8 @@ if [[ -n "$HAPROXY_DETECTED" ]]; then
                 PP_REG_MODE="none"
             fi
         fi
-        write_pp_state
     fi
+    write_pp_state   # after the readiness decision, whatever it was
 
     build_auth_header
     _haproxy_reregister_url="http://${HAPROXY_IP:-${HAPROXY_DETECTED}}:${HAPROXY_API_PORT}/v1/backends"

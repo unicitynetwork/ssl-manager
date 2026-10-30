@@ -7,9 +7,10 @@ haproxy does TLS *passthrough* on :443, so the TLS terminator is the application
 PROXY v2 enabled, ssl-manager registers this shim's port as `https_proxy_port`:
 haproxy connects here and prepends a PROXY v2 header; the shim
 
-  * honours the header only if the TCP peer is trusted (default: the docker
-    haproxy-net subnet), and CLOSES a connection from an untrusted peer that
-    starts with a PROXY signature (spoofing attempt);
+  * honours the header only if the TCP peer is trusted (default "haproxy": only
+    the haproxy container's current address, see proxyproto.TrustPolicy), and
+    CLOSES a connection from an untrusted peer that starts with a PROXY
+    signature (spoofing attempt);
   * accepts connections WITHOUT a header too (header optional) -- so a haproxy
     that stops sending it (rollback) keeps working;
   * forwards the remaining byte stream unchanged (TLS stays end-to-end between
@@ -18,7 +19,9 @@ haproxy connects here and prepends a PROXY v2 header; the shim
     trust loopback are not opened to the internet);
   * optionally re-emits the real client address to the app as a PROXY v1/v2
     header (--upstream-proxy v1|v2), for apps that can read it on a dedicated
-    listener (e.g. nginx `listen 8446 ssl proxy_protocol;`).
+    listener. That listener MUST be reachable only by the shim (bind it to
+    127.0.0.1 and point --upstream at 127.0.0.1:<port>), otherwise any peer on
+    the network can send it a forged header.
 
 The real client address is always available in the shim's own log when
 SSL_PROXY_LOG_CONNECTIONS=true.
@@ -47,33 +50,40 @@ def warn(msg: str) -> None:
     print(f"[ssl-pp-proxy] WARNING: {msg}", file=sys.stderr, flush=True)
 
 
-def resolve_upstream(spec: str) -> tuple[str, int]:
-    """'auto:<port>' -> (own non-loopback IP, port); 'host:port' otherwise."""
+EXIT_CONFIG = 2  # ssl-pp-proxy-wrapper does not restart on 2; ssl-setup then registers "none"
+
+
+def resolve_upstream(spec: str) -> tuple:
+    """'auto:<port>' -> (own non-loopback IP, port); 'host:port' otherwise.
+    Raises ValueError if 'auto' cannot find a non-loopback address: dialling
+    127.0.0.1 instead would make every internet client look local to the app."""
     host, _, port = spec.rpartition(":")
     if not host or not port.isdigit():
         raise ValueError(f"invalid upstream '{spec}' (want host:port or auto:port)")
     if host == "auto":
-        ip = None
         try:
             ip = socket.gethostbyname(socket.gethostname())
         except OSError:
             ip = None
         if not ip or ip.startswith("127."):
-            warn("could not find a non-loopback container address; falling back to 127.0.0.1 "
-                 "(apps that trust loopback will see every client as local!)")
-            ip = "127.0.0.1"
+            raise ValueError("cannot determine this container's non-loopback address for "
+                             "upstream 'auto' (refusing to fall back to 127.0.0.1)")
         host = ip
     return host, int(port)
 
 
 class Shim:
-    def __init__(self, args, policy: pp.TrustPolicy):
+    def __init__(self, args, policy: pp.TrustPolicy, upstream=None):
         self.args = args
         self.policy = policy
-        self.upstream = resolve_upstream(args.upstream)
+        self.upstream = upstream or resolve_upstream(args.upstream)
         self.sem = asyncio.Semaphore(args.max_connections)
         self.rl = pp.RateLimitedLog(warn, interval=1.0)
         self.active = 0
+
+    async def _trusted(self, peer_ip) -> bool:
+        # may hit DNS (re-resolution): keep it off the event loop
+        return await asyncio.get_running_loop().run_in_executor(None, self.policy.is_trusted, peer_ip)
 
     async def _read_header(self, reader, peer_ip):
         """Return (info|None, leftover bytes) or raise ConnectionAbortedError to reject."""
@@ -95,7 +105,7 @@ class Shim:
                 raise ConnectionResetError("peer closed before sending data")
             buf += chunk
             if pp.starts_with_signature_prefix(buf) and len(buf) >= pp.SIG_LEN \
-                    and not self.policy.is_trusted(peer_ip):
+                    and not await self._trusted(peer_ip):
                 raise ConnectionAbortedError(f"PROXY header from UNTRUSTED peer {peer_ip} rejected")
             state, val = pp.classify(buf, self.args.max_header)
             if state == pp.NOT_PROXY:
@@ -103,7 +113,7 @@ class Shim:
             if state == pp.INVALID:
                 raise ConnectionAbortedError(f"invalid PROXY header from {peer_ip}: {val}")
             if state == pp.PROXY:
-                if not self.policy.is_trusted(peer_ip):  # signature split across reads
+                if not await self._trusted(peer_ip):  # signature split across reads
                     raise ConnectionAbortedError(f"PROXY header from UNTRUSTED peer {peer_ip} rejected")
                 return val, buf[val.header_len:]
             # NEED_MORE: loop
@@ -116,7 +126,7 @@ class Shim:
                     break
                 writer.write(data)
                 await writer.drain()
-        except (ConnectionError, OSError, asyncio.CancelledError):
+        except (ConnectionError, OSError):
             pass
         finally:
             try:
@@ -139,7 +149,7 @@ class Shim:
                 try:
                     info, leftover = await self._read_header(reader, peer_ip)
                 except ConnectionAbortedError as e:
-                    self.rl("reject", str(e))
+                    self.rl(f"reject:{peer_ip}", str(e))
                     return
                 except ConnectionResetError:
                     return  # e.g. a plain TCP health probe
@@ -198,12 +208,12 @@ class Shim:
                             pass
 
 
-async def amain(args) -> None:
+async def amain(args, upstream) -> None:
     policy = pp.policy_from_env()
     if args.trusted:
         policy = pp.TrustPolicy(spec=args.trusted, haproxy_host=os.environ.get("HAPROXY_HOST") or "haproxy")
     policy.refresh_now()
-    shim = Shim(args, policy)
+    shim = Shim(args, policy, upstream)
     server = await asyncio.start_server(shim.handle, host=args.bind, port=args.listen,
                                         reuse_address=True, backlog=512)
     log(f"listening on {args.bind}:{args.listen} -> {shim.upstream[0]}:{shim.upstream[1]} "
@@ -237,11 +247,16 @@ def parse_args(argv=None):
 
 def main() -> None:
     args = parse_args()
-    if args.listen == resolve_upstream(args.upstream)[1] and args.upstream.startswith(("auto:", "127.", "localhost")):
-        print("FATAL: shim listen port equals upstream port (circular)", file=sys.stderr, flush=True)
-        raise SystemExit(2)
     try:
-        asyncio.run(amain(args))
+        upstream = resolve_upstream(args.upstream)
+    except ValueError as e:
+        print(f"[ssl-pp-proxy] FATAL: {e}", file=sys.stderr, flush=True)
+        raise SystemExit(EXIT_CONFIG)
+    if args.listen == upstream[1] and args.upstream.startswith(("auto:", "127.", "localhost")):
+        print("[ssl-pp-proxy] FATAL: shim listen port equals upstream port (circular)", file=sys.stderr, flush=True)
+        raise SystemExit(EXIT_CONFIG)
+    try:
+        asyncio.run(amain(args, upstream))
     except KeyboardInterrupt:
         pass
 

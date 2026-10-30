@@ -12,12 +12,17 @@ Configuration via CLI args and environment variables.
 
 PROXY protocol v2 (SSL_PROXY_PROTOCOL, default "v2"): a connection may start with
 a PROXY v2 header. It is honoured only when the TCP peer is trusted
-(SSL_PROXY_TRUSTED_CIDRS, default "haproxy" = only the haproxy container; "auto" = the haproxy-net subnet); a header from
-an untrusted peer closes the connection. Connections without a header are served
+(SSL_PROXY_TRUSTED_CIDRS, default "haproxy" = only the haproxy container's
+current address; see proxyproto.TrustPolicy); a header from an untrusted peer
+closes the connection. Connections without a header are served
 as before (local health checks, container-to-container calls). When a header was
 honoured, X-Forwarded-For and X-Real-IP sent upstream are OVERWRITTEN with the
-real client address (any client-supplied values are dropped).
+real client address -- or with the TCP peer if the header carried no address
+(LOCAL/UNSPEC) -- and any client-supplied values are dropped. A client-supplied
+RFC 7239 "Forwarded" header is always stripped.
 """
+
+from __future__ import annotations  # PEP 563: lets dict[...] annotations import on Python 3.8
 
 import argparse
 import http.client
@@ -168,7 +173,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 if len(data) >= pp.SIG_LEN and data[:pp.SIG_LEN] == pp.SIGNATURE \
                         and not _pp_policy.is_trusted(self.peer_ip):
                     self.pp_rejected = True
-                    _pp_log("reject", f"PROXY header from UNTRUSTED peer {self.peer_ip} rejected")
+                    _pp_log(f"reject:{self.peer_ip}", f"PROXY header from UNTRUSTED peer {self.peer_ip} rejected")
                     return
                 state, val = pp.classify(data, PP_MAX_HEADER)
                 if state == pp.NOT_PROXY:
@@ -180,7 +185,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 if state == pp.PROXY:
                     if not _pp_policy.is_trusted(self.peer_ip):
                         self.pp_rejected = True
-                        _pp_log("reject", f"PROXY header from UNTRUSTED peer {self.peer_ip} rejected")
+                        _pp_log(f"reject:{self.peer_ip}", f"PROXY header from UNTRUSTED peer {self.peer_ip} rejected")
                         return
                     need = val.header_len
                     while need > 0:  # consume exactly the header
@@ -334,8 +339,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         body = self.rfile.read(content_length) if content_length > 0 else None
 
-        # Real client address known from a trusted PROXY header?
-        pp_client = self.pp_info.src_ip if getattr(self, "pp_info", None) else None
+        # Did a trusted PROXY header arrive? Then the connection came from haproxy
+        # and everything the client claims about itself is untrusted: OVERWRITE.
+        # (client_address is the header's source, or the TCP peer for LOCAL/UNSPEC.)
+        pp_trusted = getattr(self, "pp_info", None) is not None
 
         # Build forwarded headers
         forwarded_headers = {}
@@ -346,7 +353,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             # haproxy forwards header names lower-cased, so a client-supplied
             # "x-forwarded-for" would otherwise survive NEXT TO ours and, being
             # first, win in the app (spoofable first-hop).
-            if lower in ("x-forwarded-for", "x-real-ip", "x-forwarded-host", "x-forwarded-proto"):
+            if lower in ("x-forwarded-for", "x-real-ip", "x-forwarded-host", "x-forwarded-proto",
+                         "forwarded"):
                 continue
             if lower in (
                 "connection",
@@ -363,7 +371,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         # Add/update forwarding headers
         client_ip = pp.normalize_ip(self.client_address[0])
-        if pp_client:
+        if pp_trusted:
             # haproxy told us (PROXY v2) who the client is: that is the only truth.
             forwarded_headers["X-Forwarded-For"] = client_ip
         else:

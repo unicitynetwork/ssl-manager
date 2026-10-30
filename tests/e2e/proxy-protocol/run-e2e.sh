@@ -79,9 +79,10 @@ start_backend() {  # name image domain [extra docker args...]
     docker start "$name" >/dev/null
 }
 start_backend "$NEW" "${PREFIX}-backend-new" new.pp2.test
+# new2: explicit strict trust + pinned haproxy IP + shim re-emits PROXY to the app
 start_backend "$NEW2" "${PREFIX}-backend-new" new2.pp2.test \
-    -e SSL_PROXY_TRUSTED_CIDRS=haproxy \
-    -e SSL_PROXY_HTTPS_UPSTREAM=auto:8446 -e SSL_PROXY_HTTPS_UPSTREAM_PROTOCOL=v2
+    -e SSL_PROXY_TRUSTED_CIDRS=haproxy -e SSL_PROXY_HAPROXY_ADDR="$HAP_HA_IP" \
+    -e SSL_PROXY_HTTPS_UPSTREAM=127.0.0.1:8446 -e SSL_PROXY_HTTPS_UPSTREAM_PROTOCOL=v2
 # misconfigured: shim port collides with APP_HTTP_PORT -> must degrade to "none", not die
 start_backend "$NEW3" "${PREFIX}-backend-new" new3.pp2.test -e SSL_PROXY_HTTPS_PORT=8080
 [ -n "$SSL_MANAGER_OLD_IMAGE" ] && start_backend "$OLD" "${PREFIX}-backend-old" old.pp2.test
@@ -164,29 +165,53 @@ fi
 
 if [ "$EXPECT_PP" = "true" ]; then
     echo "== (c) forged PROXY headers"
-    forge='import sys,socket;sys.path.insert(0,"/usr/local/lib/ssl-manager");import proxyproto as pp
-s=socket.create_connection((sys.argv[1],int(sys.argv[2])),timeout=5)
+    # Prints the bytes received and how long the peer took to close. A rejection
+    # must be an IMMEDIATE close (well under the 5s header timeout), not a timeout.
+    forge='import sys,socket,time;sys.path.insert(0,"/usr/local/lib/ssl-manager");import proxyproto as pp
+try:
+    s=socket.create_connection((sys.argv[1],int(sys.argv[2])),timeout=3)
+except OSError as e:
+    print("REFUSED"); sys.exit()
+t0=time.monotonic()
 s.sendall(pp.build_v2("6.6.6.6",1234,"10.0.0.1",80)+sys.argv[3].encode().decode("unicode_escape").encode("latin1"))
-s.settimeout(5);out=b""
+s.settimeout(8);out=b""
 try:
     while True:
         d=s.recv(4096)
         if not d: break
         out+=d
 except Exception: pass
-print(repr(out[:300]))'
+el=time.monotonic()-t0
+print(("CLOSED" if not out else repr(out[:300]))+" %.2fs"%el)'
+    rejected() {  # name result
+        case "$2" in
+            REFUSED) ok "$1 (refused)";;
+            CLOSED\ 0.*|CLOSED\ 1.*) ok "$1 (closed after ${2#CLOSED })";;
+            *) bad "$1" "got: $2 (want an immediate close)";;
+        esac
+    }
+    evil_ip=$(ip_of "$EVIL" "$APPNET"); evilha_ip=$(ip_of "$EVILHA" "$HANET")
     r=$(docker exec "$EVIL" python3 -c "$forge" "$(ip_of "$NEW" "$APPNET")" 80 'GET / HTTP/1.0\r\nHost: new.pp2.test\r\n\r\n')
-    check "untrusted peer (app net) forged header to :80 -> connection closed" "$r" "b''"
+    rejected "untrusted peer (app net) forged header to :80 -> immediate close" "$r"
     r=$(docker exec "$EVIL" python3 -c "$forge" "$(ip_of "$NEW" "$APPNET")" 8445 'x')
-    check "untrusted peer (app net) forged header to TLS shim -> closed" "$r" "b''"
-    r=$(docker exec "$EVILHA" python3 -c "$forge" "$(ip_of "$NEW2" "$HANET")" 80 'GET / HTTP/1.0\r\nHost: new2.pp2.test\r\n\r\n')
-    check "strict trust (haproxy only): forged header from haproxy-net peer -> closed" "$r" "b''"
-    if docker logs "$NEW" 2>&1 | grep -q "UNTRUSTED peer"; then ok "rejections are logged"; else bad "rejections not logged"; fi
-    # Documented residual risk of the DEFAULT trust (auto = whole haproxy-net subnet):
-    # any container on haproxy-net can assert a client IP. Shown, not asserted.
+    rejected "untrusted peer (app net) forged header to TLS shim -> immediate close" "$r"
+    # DEFAULT config ($NEW: no SSL_PROXY_TRUSTED_CIDRS set => "haproxy"): another
+    # container ON haproxy-net is not haproxy and must be rejected too.
     r=$(docker exec "$EVILHA" python3 -c "$forge" "$NEW_HA_IP" 80 'GET / HTTP/1.0\r\nHost: new.pp2.test\r\n\r\n')
-    case "$r" in *6.6.6.6*) echo "     INFO (documented risk): default trust=auto accepts a header from another haproxy-net container: $(echo "$r" | grep -o '"x_real_ip": "[^"]*"')";;
-                 *) echo "     INFO: haproxy-net peer header not adopted: $(echo "$r" | cut -c1-60)";; esac
+    rejected "DEFAULT trust: forged header from a haproxy-net peer to :80 -> immediate close" "$r"
+    r=$(docker exec "$EVILHA" python3 -c "$forge" "$NEW_HA_IP" 8445 'x')
+    rejected "DEFAULT trust: forged header from a haproxy-net peer to TLS shim -> immediate close" "$r"
+    r=$(docker exec "$EVILHA" python3 -c "$forge" "$(ip_of "$NEW2" "$HANET")" 80 'GET / HTTP/1.0\r\nHost: new2.pp2.test\r\n\r\n')
+    rejected "strict trust + pinned addr: forged header from haproxy-net peer -> immediate close" "$r"
+    for who in "$evil_ip" "$evilha_ip"; do
+        if docker logs "$NEW" 2>&1 | grep -q "UNTRUSTED peer $who rejected"; then ok "rejection of $who is logged"; else bad "rejection of $who not logged"; fi
+    done
+    # The app-side PROXY listener (new2, 127.0.0.1:8446) must not be reachable by
+    # anyone but the shim: a forged header straight to it is never adopted.
+    r=$(docker exec "$EVILHA" python3 -c "$forge" "$(ip_of "$NEW2" "$HANET")" 8446 'x')
+    case "$r" in *6.6.6.6*) bad "forged header to the app PROXY listener was adopted" "$r";; *) ok "forged header to the app PROXY listener not adopted ($r)";; esac
+    r=$(docker exec "$NEW2" python3 -c "$forge" "$(ip_of "$NEW2" "$HANET")" 8446 'x')
+    case "$r" in *6.6.6.6*) bad "forged header via the container's own IP was adopted" "$r";; *) ok "app PROXY listener ignores its own non-loopback IP ($r)";; esac
     # A client sending a header THROUGH haproxy: haproxy's real header comes first,
     # the forged one is just payload -> never adopted.
     r=$(docker exec "$CLIENT" python3 -c "$forge" "$HAP_EXT_IP" 80 'GET / HTTP/1.0\r\nHost: new.pp2.test\r\n\r\n')
@@ -217,6 +242,21 @@ print(repr(out[:300]))'
     check "after haproxy restart: real client IP on :80" "$(echo "$out" | j x_real_ip)" "$CLIENT_IP"
     out=$(https_via "$CLIENT" new2.pp2.test)
     check "after haproxy restart: real client IP on :443" "$(echo "$out" | j pp_src)" "$CLIENT_IP"
+fi
+
+if [ "$EXPECT_PP" = "true" ]; then
+    echo "== (M5) dead shim: haproxy falls back to the header-less backup server"
+    docker exec "$NEW" sh -c 'kill $(cat /tmp/.ssl-pp-proxy-wrapper.pid) $(cat /tmp/.ssl-pp-proxy.pid)' 2>/dev/null
+    sleep 1
+    check "shim is really gone" "$(docker exec "$NEW" sh -c 'nc -z localhost 8445 && echo up || echo down')" "down"
+    out=""; t0=$(date +%s)
+    for _ in $(seq 1 60); do
+        out=$(https_via "$CLIENT" new.pp2.test)
+        [ "$(echo "$out" | j listener)" = "tls" ] && break
+        sleep 1
+    done
+    check "https still served with the shim dead (backup, $(( $(date +%s) - t0 ))s)" "$(echo "$out" | j listener)" "tls"
+    check "backup path is header-less (app peer = haproxy)" "$(echo "$out" | j peer)" "$HAP_HA_IP"
 fi
 
 echo ""

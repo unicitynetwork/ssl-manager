@@ -103,6 +103,11 @@ class TestParse(unittest.TestCase):
         self.assertIn("exceeds", reason)
         short_v4 = pp.SIGNATURE + b"\x21\x11" + (4).to_bytes(2, "big") + b"\x01\x02\x03\x04"
         self.assertEqual(pp.classify(short_v4)[0], pp.INVALID)
+        for fam in (0x4, 0x5, 0xF):  # only families 0..3 exist
+            bad_fam = bytes(h[:13]) + bytes([(fam << 4) | 1]) + bytes(h[14:])
+            st, reason = pp.classify(bad_fam)
+            self.assertEqual(st, pp.INVALID, fam)
+            self.assertIn("family", reason)
 
     def test_tlvs_are_skipped(self):
         h = pp.build_v2("1.2.3.4", 1, "5.6.7.8", 2)
@@ -174,14 +179,60 @@ class TestTrust(unittest.TestCase):
         now[0] += 6
         self.assertTrue(t.is_trusted("172.20.0.9"))
 
-    def test_resolution_blip_keeps_last_good(self):
+    def _fake(self, ips, spec="haproxy"):
+        now = [0.0]
+        warnings = []
+        t = pp.TrustPolicy(spec, resolver=lambda h: list(ips[0]), clock=lambda: now[0],
+                           warn=warnings.append)
+        return t, now, warnings
+
+    def test_default_spec_is_haproxy_and_ttl_capped(self):
+        t = pp.TrustPolicy(resolver=lambda h: [])
+        self.assertTrue(t.use_haproxy and not t.use_auto)
+        self.assertLessEqual(pp.TrustPolicy(refresh=60, resolver=lambda h: []).refresh, 10)
+        self.assertTrue(pp.policy_from_env({}).use_haproxy)
+
+    def test_haproxy_removed_fails_closed(self):
+        ips = [["172.20.0.9"]]
+        t, now, warnings = self._fake(ips)
+        self.assertTrue(t.is_trusted("172.20.0.9"))
+        ips[0] = []  # haproxy container removed: name no longer resolves
+        now[0] += 10
+        self.assertFalse(t.is_trusted("172.20.0.9"), "cached address must not survive a failed lookup")
+        self.assertTrue(any("no longer resolves" in w for w in warnings))
+        # and a later miss does not resurrect it either
+        now[0] += 30
+        self.assertFalse(t.is_trusted("172.20.0.9"))
+
+    def test_haproxy_new_ip_old_ip_untrusted_within_ttl(self):
+        ips = [["172.20.0.9"]]
+        t, now, _ = self._fake(ips)
+        self.assertTrue(t.is_trusted("172.20.0.9"))
+        ips[0] = ["172.20.0.44"]  # haproxy restarted; .9 may now belong to another container
+        now[0] += 3
+        self.assertTrue(t.is_trusted("172.20.0.44"), "new IP picked up by the miss re-resolution")
+        self.assertFalse(t.is_trusted("172.20.0.9"), "old IP dropped as soon as the set refreshed")
+        # even with no miss to trigger it, a HIT re-resolves once the TTL (<=10s) expires
+        ips[0] = ["172.20.0.55"]
+        now[0] += 10
+        self.assertFalse(t.is_trusted("172.20.0.44"))
+
+    def test_multiple_addresses_warn_loudly(self):
+        ips = [["172.20.0.9", "172.20.0.66"]]
+        t, now, warnings = self._fake(ips)
+        self.assertTrue(t.is_trusted("172.20.0.66"))
+        self.assertTrue(any("resolves to 2 addresses" in w for w in warnings))
+
+    def test_pinned_haproxy_addr_survives_dns_outage(self):
         now = [0.0]
         ips = [["172.20.0.9"]]
-        t = pp.TrustPolicy("haproxy", resolver=lambda h: ips[0], clock=lambda: now[0], refresh=10)
+        t = pp.policy_from_env({"SSL_PROXY_HAPROXY_ADDR": "172.20.0.9"})
+        t._resolver, t._clock, t._warn = (lambda h: list(ips[0])), (lambda: now[0]), (lambda m: None)
         self.assertTrue(t.is_trusted("172.20.0.9"))
-        ips[0] = []  # DNS hiccup
-        now[0] += 11
-        self.assertTrue(t.is_trusted("172.20.0.9"))
+        ips[0] = []
+        now[0] += 20
+        self.assertTrue(t.is_trusted("172.20.0.9"), "static pin is trusted without DNS")
+        self.assertFalse(t.is_trusted("172.20.0.10"))
 
     def test_env(self):
         self.assertTrue(pp.pp_enabled_from_env({}))
@@ -240,7 +291,7 @@ class UpstreamRecorder:
 
 
 class ShimHarness:
-    def __init__(self, trusted, upstream_port, upstream_proxy="none", header_timeout=1.0):
+    def __init__(self, trusted, upstream_port, upstream_proxy="none", header_timeout=3.0):
         self.shim_mod = load_script("ssl_pp_proxy", "ssl-pp-proxy.py")
         self.port = free_port()
         args = self.shim_mod.parse_args([
@@ -271,11 +322,17 @@ class ShimHarness:
         self.loop.call_soon_threadsafe(self.loop.stop)
 
     def talk(self, payload):
-        s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
-        s.sendall(payload)
-        out = recv_all(s, timeout=3)
-        s.close()
+        out, _ = self.talk_timed(payload)
         return out
+
+    def talk_timed(self, payload):
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        t0 = time.monotonic()
+        s.sendall(payload)
+        out = recv_all(s, timeout=8)
+        elapsed = time.monotonic() - t0
+        s.close()
+        return out, elapsed
 
 
 class TestShim(unittest.TestCase):
@@ -299,8 +356,9 @@ class TestShim(unittest.TestCase):
 
     def test_untrusted_header_is_rejected(self):
         self.shim = ShimHarness("10.9.9.9", self.up.port)  # loopback is NOT trusted
-        out = self.shim.talk(pp.build_v2("6.6.6.6", 1, "7.7.7.7", 2) + b"evil\n")
+        out, elapsed = self.shim.talk_timed(pp.build_v2("6.6.6.6", 1, "7.7.7.7", 2) + b"evil\n")
         self.assertEqual(out, b"")
+        self.assertLess(elapsed, 1.0, "must be an immediate close, not the 3s header timeout")
         time.sleep(0.2)
         self.assertEqual(self.up.received, [], "forged header must never reach the app")
 
@@ -310,8 +368,9 @@ class TestShim(unittest.TestCase):
 
     def test_oversized_header_rejected(self):
         self.shim = ShimHarness("127.0.0.1", self.up.port)
-        out = self.shim.talk(pp.SIGNATURE + b"\x21\x11" + (5000).to_bytes(2, "big") + b"x" * 100)
+        out, elapsed = self.shim.talk_timed(pp.SIGNATURE + b"\x21\x11" + (5000).to_bytes(2, "big") + b"x" * 100)
         self.assertEqual(out, b"")
+        self.assertLess(elapsed, 1.0)
 
     def test_split_header_across_segments(self):
         self.shim = ShimHarness("127.0.0.1", self.up.port)
@@ -335,6 +394,22 @@ class TestShim(unittest.TestCase):
         self.shim = ShimHarness("127.0.0.1", self.up.port, upstream_proxy="v1")
         self.shim.talk(pp.build_v2("203.0.113.7", 4444, "172.20.0.5", 443) + b"x\n")
         self.assertTrue(self.up.received[-1].startswith(b"PROXY TCP4 203.0.113.7 172.20.0.5 4444 443\r\n"))
+
+    def test_auto_upstream_without_own_address_exits_2(self):
+        mod = load_script("ssl_pp_proxy_m1", "ssl-pp-proxy.py")
+        orig = mod.socket.gethostbyname
+        mod.socket.gethostbyname = lambda h: "127.0.1.1"
+        argv = sys.argv
+        try:
+            with self.assertRaises(ValueError):
+                mod.resolve_upstream("auto:443")
+            sys.argv = ["ssl-pp-proxy", "--upstream", "auto:443", "--listen", str(free_port())]
+            with self.assertRaises(SystemExit) as cm:
+                mod.main()
+            self.assertEqual(cm.exception.code, 2)
+        finally:
+            mod.socket.gethostbyname = orig
+            sys.argv = argv
 
     def test_health_check_local_and_connect_only(self):
         self.shim = ShimHarness("127.0.0.1", self.up.port)
@@ -371,7 +446,7 @@ class TestHttpProxy(unittest.TestCase):
         cls.app = http.server.ThreadingHTTPServer(("127.0.0.1", cls.app_port), HeaderEchoApp)
         threading.Thread(target=cls.app.serve_forever, daemon=True).start()
         cls.mod = load_script("ssl_http_proxy", "ssl-http-proxy.py")
-        cls.mod.PP_HEADER_TIMEOUT = 1.0
+        cls.mod.PP_HEADER_TIMEOUT = 3.0
         cls.mod._config = {"port": 0, "webroot": "/nonexistent", "upstream": f"127.0.0.1:{cls.app_port}",
                            "cert_dir": ""}
         cls.port = free_port()
@@ -388,11 +463,16 @@ class TestHttpProxy(unittest.TestCase):
         self.mod._pp_policy = self.mod.pp.TrustPolicy(trusted, resolver=lambda h: [])
 
     def request(self, prefix=b"", extra_headers=""):
+        return self.request_timed(prefix, extra_headers)[0]
+
+    def request_timed(self, prefix=b"", extra_headers=""):
         s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        t0 = time.monotonic()
         s.sendall(prefix + f"GET /x HTTP/1.1\r\nHost: t.example\r\n{extra_headers}Connection: close\r\n\r\n".encode())
-        raw = recv_all(s)
+        raw = recv_all(s, timeout=8)
+        elapsed = time.monotonic() - t0
         s.close()
-        return raw
+        return raw, elapsed
 
     def body(self, raw):
         head, _, body = raw.partition(b"\r\n\r\n")
@@ -426,13 +506,26 @@ class TestHttpProxy(unittest.TestCase):
 
     def test_untrusted_header_rejected(self):
         self.set_policy(True, trusted="10.9.9.9")
-        raw = self.request(pp.build_v2("6.6.6.6", 1, "7.7.7.7", 80))
+        raw, elapsed = self.request_timed(pp.build_v2("6.6.6.6", 1, "7.7.7.7", 80))
         self.assertEqual(raw, b"")
+        self.assertLess(elapsed, 1.0, "must be an immediate close, not the 3s header timeout")
 
-    def test_local_header_uses_peer(self):
+    def test_local_header_uses_peer_and_overwrites(self):
+        # trusted header without an address: TCP peer, and client claims are DROPPED
         self.set_policy(True)
-        h = self.body(self.request(pp.build_local_v2()))
+        h = self.body(self.request(pp.build_local_v2(), "X-Forwarded-For: 6.6.6.6\r\nX-Real-IP: 6.6.6.6\r\n"))
         self.assertEqual(h["x-forwarded-for"], "127.0.0.1")
+        self.assertEqual(h["x-real-ip"], "127.0.0.1")
+        unspec = pp.SIGNATURE + b"\x21\x00" + (0).to_bytes(2, "big")
+        h = self.body(self.request(unspec, "X-Forwarded-For: 6.6.6.6\r\n"))
+        self.assertEqual(h["x-forwarded-for"], "127.0.0.1")
+
+    def test_forwarded_header_stripped(self):
+        self.set_policy(True)
+        h = self.body(self.request(b"", "Forwarded: for=6.6.6.6\r\n"))
+        self.assertNotIn("forwarded", h)
+        h = self.body(self.request(pp.build_v2("203.0.113.7", 1, "172.20.0.5", 80), "forwarded: for=6.6.6.6\r\n"))
+        self.assertNotIn("forwarded", h)
 
     def test_disabled_does_not_parse(self):
         # PROXY off: the header is NOT interpreted (a stray one just breaks that request)

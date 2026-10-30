@@ -3,8 +3,10 @@
 
   :8080  HTTP   -> {"listener":"http","peer":..,"xff":..,"x_real_ip":..}
   :443   TLS    -> {"listener":"tls","peer":..}            (default shim mode)
-  :8446  PROXY v2 (required) + TLS -> {"listener":"pp-tls","peer":..,"pp_src":..}
-                                                          (shim upstream-proxy v2)
+  127.0.0.1:8446  PROXY v2 (required) + TLS -> {"listener":"pp-tls",..,"pp_src":..}
+                 (shim upstream-proxy v2). Bound to loopback AND only accepting the
+                 shim's source address: a PROXY listener reachable by other peers
+                 would let any of them forge a client IP.
 """
 import json
 import os
@@ -61,11 +63,14 @@ def respond_tls(conn, payload):
             pass
 
 
-def serve_tls(port, require_pp):
+SHIM_SOURCE = "127.0.0.1"
+
+
+def serve_tls(port, require_pp, bind="0.0.0.0"):
     ctx = tls_ctx()
     ls = socket.socket()
     ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    ls.bind(("0.0.0.0", port))
+    ls.bind((bind, port))
     ls.listen(64)
     while True:
         c, addr = ls.accept()
@@ -77,6 +82,9 @@ def handle_tls(ctx, c, addr, require_pp):
     try:
         c.settimeout(5)
         if require_pp:
+            if addr[0] != SHIM_SOURCE:  # ACL: only the shim may assert client IPs
+                c.close()
+                return
             data = c.recv(2048, socket.MSG_PEEK)
             st, info = pp.classify(data)
             if st != pp.PROXY:
@@ -94,5 +102,5 @@ def handle_tls(ctx, c, addr, require_pp):
 if __name__ == "__main__":
     threading.Thread(target=serve_tls, args=(443, False), daemon=True).start()
     if pp is not None:
-        threading.Thread(target=serve_tls, args=(8446, True), daemon=True).start()
+        threading.Thread(target=serve_tls, args=(8446, True, SHIM_SOURCE), daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", 8080), H).serve_forever()

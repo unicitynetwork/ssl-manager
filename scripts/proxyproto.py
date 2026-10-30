@@ -26,6 +26,7 @@ import ipaddress
 import os
 import socket
 import struct
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -109,6 +110,8 @@ def classify(buf: bytes, max_payload: int = DEFAULT_MAX_PAYLOAD):
 
     payload = buf[FIXED_LEN:total]
     family = fam_proto >> 4
+    if family > 0x3:  # only UNSPEC(0), INET(1), INET6(2), UNIX(3) exist
+        return INVALID, f"unsupported PROXY address family {family}"
 
     if command == CMD_LOCAL:
         return PROXY, ProxyInfo("LOCAL", None, None, None, None, total)
@@ -127,7 +130,8 @@ def classify(buf: bytes, max_payload: int = DEFAULT_MAX_PAYLOAD):
         dst = socket.inet_ntop(socket.AF_INET6, payload[16:32])
         sport, dport = struct.unpack("!HH", payload[32:36])
         return PROXY, ProxyInfo("PROXY", normalize_ip(src), sport, normalize_ip(dst), dport, total)
-    # AF_UNSPEC / AF_UNIX: no usable address -> behave like LOCAL
+    # AF_UNSPEC / AF_UNIX: no usable address -> behave like LOCAL (callers use the
+    # TCP peer and still OVERWRITE forwarding headers with it)
     return PROXY, ProxyInfo("PROXY", None, None, None, None, total)
 
 
@@ -224,46 +228,54 @@ def _connected_ipv6_routes(route_file: str = "/proc/net/ipv6_route"):
 
 
 class TrustPolicy:
-    """Which TCP peers may supply a PROXY header.
+    """Which TCP peers may supply a PROXY header. Fails CLOSED.
 
     spec is a comma/space separated list of:
-      <CIDR> or <IP>  static entries (IPv4 or IPv6)
+      haproxy         only the haproxy host's current IP address(es) -- the DEFAULT
+                      (strictest; re-resolved, so a restarted haproxy with a new IP
+                      is followed and the old IP stops being trusted)
       auto            the directly-connected subnet(s) through which the haproxy
-                      host is reached (i.e. the docker haproxy-net subnet). This is
-                      the DEFAULT.
-      haproxy         only the haproxy host's current IP address(es) (strictest;
-                      re-resolved, so a restarted haproxy with a new IP is followed)
+                      host is reached (the whole docker haproxy-net subnet: any
+                      container on it can then assert client IPs -- not recommended)
+      <CIDR> or <IP>  static entries (IPv4 or IPv6), e.g. a pinned haproxy address
       none            trust nobody (every header is rejected)
-    Dynamic entries are re-resolved every `refresh` seconds and, rate-limited, on a
-    miss -- so a haproxy that started after us, or restarted with a new IP, is
-    picked up without restarting the proxy.
+
+    Dynamic entries are cached for at most `refresh` seconds (default 10): a lookup
+    after that re-resolves, on hits as well as misses, and a miss additionally
+    forces a (rate-limited) re-resolution. If resolution returns NOTHING the
+    dynamic set is CLEARED (fail closed) -- a removed haproxy, or a stale address
+    now owned by another container, is never trusted from cache. Pin the haproxy
+    address statically (SSL_PROXY_HAPROXY_ADDR / a CIDR entry) to survive DNS
+    outages.
     """
 
     def __init__(
         self,
-        spec: str = "auto",
+        spec: str = "haproxy",
         haproxy_host: str = "haproxy",
-        refresh: float = 60.0,
+        refresh: float = 10.0,
         miss_refresh: float = 5.0,
-        resolver: Callable[[str], list[str]] = _resolve_all,
+        resolver: Callable[[str], list] = _resolve_all,
         v4_routes: Callable[[], list] = _connected_ipv4_routes,
         v6_routes: Callable[[], list] = _connected_ipv6_routes,
         clock: Callable[[], float] = time.monotonic,
+        warn: Optional[Callable[[str], None]] = None,
     ):
         self.haproxy_host = haproxy_host or "haproxy"
-        self.refresh = refresh
+        self.refresh = min(float(refresh), 10.0)
         self.miss_refresh = miss_refresh
         self._resolver = resolver
         self._v4_routes = v4_routes
         self._v6_routes = v6_routes
         self._clock = clock
+        self._warn = warn or (lambda m: print(f"[proxyproto] WARNING: {m}", file=sys.stderr, flush=True))
         self._lock = threading.Lock()
         self.static: list = []
         self.use_auto = False
         self.use_haproxy = False
-        tokens = [t for t in (spec or "auto").replace(",", " ").split() if t]
+        tokens = [t for t in (spec or "haproxy").replace(",", " ").split() if t]
         if not tokens:
-            tokens = ["auto"]
+            tokens = ["haproxy"]
         for tok in tokens:
             low = tok.lower()
             if low == "auto":
@@ -282,6 +294,7 @@ class TrustPolicy:
                     raise ValueError(f"refusing to trust the whole address space: {tok}")
                 self.static.append(net)
         self._dynamic: list = []
+        self._last_resolved: list = []
         self._last_refresh = None
         self._last_miss_refresh = None
 
@@ -292,6 +305,14 @@ class TrustPolicy:
     def _compute_dynamic(self) -> list:
         nets = []
         ips = self._resolver(self.haproxy_host)
+        if self.use_haproxy and len(ips) > 1 and ips != self._last_resolved:
+            self._warn(f"haproxy host '{self.haproxy_host}' resolves to {len(ips)} addresses "
+                       f"({', '.join(ips)}): ALL are trusted to assert client IPs -- check for a "
+                       f"duplicate/impostor container using that name or alias")
+        if not ips and self._last_resolved:
+            self._warn(f"haproxy host '{self.haproxy_host}' no longer resolves: PROXY headers "
+                       f"are now rejected (fail closed) until it does")
+        self._last_resolved = list(ips)
         for ip in ips:
             addr = ipaddress.ip_address(ip)
             if self.use_haproxy:
@@ -313,10 +334,9 @@ class TrustPolicy:
     def refresh_now(self) -> None:
         if not self.is_dynamic:
             return
-        nets = self._compute_dynamic()
+        nets = self._compute_dynamic()  # [] on resolution failure => fail closed
         with self._lock:
-            if nets or self._last_refresh is None:
-                self._dynamic = nets
+            self._dynamic = nets
             self._last_refresh = self._clock()
 
     def _maybe_refresh(self) -> None:
@@ -336,7 +356,7 @@ class TrustPolicy:
             addr = ipaddress.ip_address(normalize_ip(ip))
         except (ValueError, TypeError):
             return False
-        self._maybe_refresh()
+        self._maybe_refresh()  # cached set is never older than `refresh`, hit or miss
         if self._match(addr):
             return True
         if self.is_dynamic:
@@ -359,10 +379,14 @@ class TrustPolicy:
 
 
 def policy_from_env(env=os.environ) -> TrustPolicy:
-    return TrustPolicy(
-        spec=env.get("SSL_PROXY_TRUSTED_CIDRS", "haproxy"),
-        haproxy_host=env.get("HAPROXY_HOST") or "haproxy",
-    )
+    """SSL_PROXY_TRUSTED_CIDRS (default "haproxy") plus SSL_PROXY_HAPROXY_ADDR: an
+    optional static haproxy IP/CIDR list trusted in ADDITION to the DNS name, so
+    a docker-DNS outage does not reject haproxy's headers."""
+    spec = env.get("SSL_PROXY_TRUSTED_CIDRS", "haproxy") or "haproxy"
+    pinned = (env.get("SSL_PROXY_HAPROXY_ADDR") or "").strip()
+    if pinned:
+        spec = f"{spec},{pinned}"
+    return TrustPolicy(spec=spec, haproxy_host=env.get("HAPROXY_HOST") or "haproxy")
 
 
 def pp_enabled_from_env(env=os.environ) -> bool:
@@ -384,6 +408,9 @@ class RateLimitedLog:
     def __call__(self, key: str, msg: str) -> None:
         now = self.clock()
         with self._lock:
+            if len(self._last) > 4096:  # bound memory under many distinct keys (peers)
+                self._last.clear()
+                self._dropped.clear()
             last = self._last.get(key)
             if last is not None and now - last < self.interval:
                 self._dropped[key] = self._dropped.get(key, 0) + 1

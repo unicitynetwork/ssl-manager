@@ -87,8 +87,12 @@ HTTPS_PROXY_PORT_REG="null"
 if [[ -f /tmp/.ssl-proxy-protocol ]]; then
     _m=$(sed -n 's/^SSL_PP_REGISTERED_MODE=//p' /tmp/.ssl-proxy-protocol | head -1)
     _p=$(sed -n 's/^SSL_PP_HTTPS_PROXY_PORT=//p' /tmp/.ssl-proxy-protocol | head -1)
-    [[ "$_m" == "v2" ]] && PP_REG_MODE="v2"
-    [[ "$PP_REG_MODE" == "v2" && "$_p" =~ ^[0-9]+$ ]] && HTTPS_PROXY_PORT_REG="$_p"
+    # v2 is only valid together with the shim port ssl-setup verified; anything
+    # else (truncated/hand-edited file) is treated as "none".
+    if [[ "$_m" == "v2" && "$_p" =~ ^[0-9]+$ ]]; then
+        PP_REG_MODE="v2"
+        HTTPS_PROXY_PORT_REG="$_p"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
