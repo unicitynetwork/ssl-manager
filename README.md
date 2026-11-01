@@ -178,6 +178,38 @@ A background loop runs every ~12 hours and calls `certbot renew`. When a certifi
 | `HAPROXY_API_KEY` | No | (empty) | Bearer token for HAProxy API authentication |
 | `APP_HTTP_PORT` | No | `0` | Your app's HTTP port behind the proxy. `0` = disabled |
 | `EXTRA_PORTS` | No | (empty) | JSON array of extra port mappings for HAProxy |
+| `SSL_PROXY_PROTOCOL` | No | `v2` | Accept PROXY protocol v2 from haproxy and register for it (`off` opts out; default `off` in remote tunnel mode). See "Real client IPs" below. |
+| `SSL_PROXY_TRUSTED_CIDRS` | No | `haproxy` | Peers allowed to send a PROXY header: `haproxy` = only the haproxy host (default, strict), `auto` = haproxy-net subnet, or CIDR/IP list. A well-formed header from anyone else is stripped and ignored (the connection is served as direct, the claimed address is never adopted or forwarded; logged at most once a minute per peer); garbage after the signature closes it. Fails closed: the haproxy address is re-resolved at least every 10 s, and if the name does not resolve nothing is trusted. |
+| `SSL_PROXY_HAPROXY_ADDR` | No | (empty) | Optional static haproxy IP/CIDR(s), trusted in addition to the DNS name (survives docker-DNS outages). |
+| `SSL_PROXY_HTTPS_PORT` | No | `8445` | Port of the PROXY-aware TLS shim haproxy's :443 passthrough is routed to (forwards to `SSL_HTTPS_PORT`). |
+| `SSL_PROXY_HTTPS_UPSTREAM` | No | `auto:$SSL_HTTPS_PORT` | Shim upstream. `auto` = this container's own non-loopback IP; if none is found the shim exits and ssl-setup registers `none`, it never silently dials 127.0.0.1. With an upstream PROXY protocol, use `127.0.0.1:<loopback-only PROXY listener>`. |
+| `SSL_PROXY_HTTPS_UPSTREAM_PROTOCOL` | No | `none` | `v2`/`v1`: shim re-emits the real client address to the app as a PROXY header (point the upstream at a dedicated PROXY listener of the app). That listener must be reachable **only by the shim** (bind it to 127.0.0.1 and accept only that source). |
+| `SSL_PROXY_LOG_CONNECTIONS` | No | `false` | Log the real client address of each shim connection. |
+| `SSL_PROXY_HEADER_TIMEOUT` | No | `10` | Shim: seconds to wait for a PROXY header; a connection with no byte flowing either way for this long is closed. |
+| `SSL_PP_IDLE_TIMEOUT` | No | `600` | Shim: close a connection with no bytes in either direction for this many seconds (`0` disables). |
+| `SSL_PP_HALF_CLOSE_GRACE` | No | `5` | Shim: once one side closed, seconds the other direction may linger before both sides are closed. |
+| `SSL_PP_MAX_CONN_PER_UNTRUSTED_PEER` | No | `64` | Shim and :80 proxy: concurrent connections per NON-trusted peer IP (`0` disables). The trusted haproxy is bounded only by the global limit. |
+| `SSL_HTTP_IDLE_TIMEOUT` | No | `60` | :80 proxy: per-connection socket timeout in seconds (`0` disables). |
+
+At registration ssl-setup runs a trust self-test (`proxyproto.py selftest`): if haproxy's resolved address set is empty, not fully trusted, or ambiguous (several addresses, none pinned), it registers `proxy_protocol: none` instead of v2.
+
+### Real client IPs (PROXY protocol v2)
+
+Since the `proxy-protocol-v2-default` release, a container registers with haproxy using `"proxy_protocol":"v2"`. haproxy then prepends a PROXY v2 header. Full design: haproxy repo `docs/PROXY-PROTOCOL-V2-DESIGN.md`.
+
+- **HTTP (:80):** `ssl-http-proxy` reads the header and **overwrites** `X-Forwarded-For` and `X-Real-IP` with the real client address, or with the TCP peer if the header carried no address. Client-supplied values are discarded, and a client `Forwarded:` header is always stripped. Read `X-Real-IP` (or the single XFF value) in your app.
+- **TLS (:443 passthrough):** haproxy sends to the shim on `SSL_PROXY_HTTPS_PORT` (8445). The shim forwards the untouched TLS stream to your `SSL_HTTPS_PORT`. Your app sees the shim's (container) address. For your app to see the client, give it a PROXY listener that **only the shim can reach**, and set `SSL_PROXY_HTTPS_UPSTREAM=127.0.0.1:8446` and `SSL_PROXY_HTTPS_UPSTREAM_PROTOCOL=v2`. nginx example:
+  ```nginx
+  listen 127.0.0.1:8446 ssl proxy_protocol;   # loopback only, never 0.0.0.0
+  set_real_ip_from 127.0.0.1/32;               # trust the header only from the shim
+  real_ip_header proxy_protocol;
+  proxy_set_header X-Real-IP $remote_addr;     # use $remote_addr, NEVER $proxy_protocol_addr
+  ```
+  - `$proxy_protocol_addr` is whatever header arrived, unchecked.
+  - A PROXY listener that any other container can reach lets that container forge client IPs.
+- **Extra ports:** these are untouched by default. Add `"proxy_protocol":"v2"` to an `EXTRA_PORTS` entry only if that listener parses PROXY v2.
+- **Unchanged paths:** direct connections without a header still work, including health checks, container-to-container calls, and `localhost`.
+- **Rollback safety:** the header is optional on every ssl-manager listener. If haproxy stops sending it, the container keeps working.
 
 ## Provided Scripts
 

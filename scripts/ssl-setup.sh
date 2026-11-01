@@ -40,6 +40,10 @@ readonly LOG_PREFIX="[${SCRIPT_NAME}]"
 : "${APP_HTTP_PORT:=0}"
 : "${HAPROXY_API_PORT:=8404}"
 : "${SSL_SKIP_VERIFY:=false}"
+# PROXY protocol v2 towards haproxy (default ON; SSL_PROXY_PROTOCOL=off opts out).
+# See haproxy repo docs/PROXY-PROTOCOL-V2-DESIGN.md.
+: "${SSL_PROXY_HTTPS_PORT:=8445}"
+readonly PP_STATE_FILE="/tmp/.ssl-proxy-protocol"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -58,6 +62,7 @@ die() {
 HTTP_PROXY_PID=""
 TLS_TEST_PID=""
 TUNNEL_MANAGER_PID=""
+PP_SHIM_PID=""
 
 cleanup_on_error() {
     if [[ -n "$HTTP_PROXY_PID" ]]; then
@@ -68,6 +73,9 @@ cleanup_on_error() {
     fi
     if [[ -n "$TUNNEL_MANAGER_PID" ]]; then
         kill "$TUNNEL_MANAGER_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$PP_SHIM_PID" ]]; then
+        kill "$PP_SHIM_PID" 2>/dev/null || true
     fi
 }
 trap cleanup_on_error ERR
@@ -151,6 +159,68 @@ if [[ -n "${REMOTE_HAPROXY_ID:-}" ]]; then
     log "  TUNNEL_CLIENT_IP=${TUNNEL_CLIENT_IP:-<not set>}"
     log "  Tunnel manager PID: ${TUNNEL_MANAGER_PID}"
 fi
+
+# ---------------------------------------------------------------------------
+# Step 0c: PROXY protocol mode
+# ---------------------------------------------------------------------------
+# Default v2. Remote-tunnel mode defaults to off: the tunnel path does not carry
+# haproxy's PROXY header to us unchanged, so there is nothing trustworthy to read.
+if [[ -z "${SSL_PROXY_PROTOCOL:-}" ]]; then
+    if [[ -n "${REMOTE_HAPROXY_ID:-}" ]]; then
+        SSL_PROXY_PROTOCOL=off
+        log "PROXY protocol: off by default in remote tunnel mode (set SSL_PROXY_PROTOCOL=v2 to force)"
+    else
+        SSL_PROXY_PROTOCOL=v2
+    fi
+fi
+# Misconfiguration never takes the service down: it falls back to "off" (exactly
+# the pre-PROXY behaviour) with a loud warning.
+case "${SSL_PROXY_PROTOCOL,,}" in
+    v2|on|true|yes|1)              PP_MODE="v2" ;;
+    off|none|false|no|0|disabled)  PP_MODE="none" ;;
+    *) warn "Invalid SSL_PROXY_PROTOCOL='${SSL_PROXY_PROTOCOL}' (use v2 or off) -- PROXY protocol DISABLED"
+       PP_MODE="none" ;;
+esac
+if [[ "$PP_MODE" == "v2" ]]; then
+    if ! [[ "$SSL_PROXY_HTTPS_PORT" =~ ^[0-9]+$ ]] || (( SSL_PROXY_HTTPS_PORT < 1 || SSL_PROXY_HTTPS_PORT > 65535 )); then
+        warn "Invalid SSL_PROXY_HTTPS_PORT='${SSL_PROXY_HTTPS_PORT}' -- PROXY protocol DISABLED"
+        PP_MODE="none"
+    else
+        # Ports the shim must not take: ours, the app's, and every EXTRA_PORTS target.
+        _pp_taken=" 80 8404 8443 8444 8000 ${SSL_HTTPS_PORT} ${APP_HTTP_PORT} "
+        if [[ -n "${EXTRA_PORTS:-}" && "${EXTRA_PORTS}" != "null" ]]; then
+            _pp_taken+="$(echo "$EXTRA_PORTS" | jq -r '.[]?.target? // empty' 2>/dev/null | tr '\n' ' ') "
+        fi
+        if [[ "$_pp_taken" == *" ${SSL_PROXY_HTTPS_PORT} "* ]]; then
+            warn "SSL_PROXY_HTTPS_PORT=${SSL_PROXY_HTTPS_PORT} collides with a port in use (80, 8000, 8404, 8443, 8444, SSL_HTTPS_PORT, APP_HTTP_PORT or an EXTRA_PORTS target) -- PROXY protocol DISABLED; set SSL_PROXY_HTTPS_PORT to a free port"
+            PP_MODE="none"
+        fi
+    fi
+fi
+# ssl-http-proxy / ssl-pp-proxy read this from the environment
+if [[ "$PP_MODE" == "v2" ]]; then export SSL_PROXY_PROTOCOL=v2; else export SSL_PROXY_PROTOCOL=off; fi
+if [[ "$PP_MODE" == "v2" ]]; then
+    log "PROXY protocol v2: enabled (trusted sources: ${SSL_PROXY_TRUSTED_CIDRS:-haproxy}${SSL_PROXY_HAPROXY_ADDR:+ + pinned ${SSL_PROXY_HAPROXY_ADDR}}; TLS shim port ${SSL_PROXY_HTTPS_PORT} -> app ${SSL_HTTPS_PORT})"
+else
+    log "PROXY protocol: off (SSL_PROXY_PROTOCOL=${SSL_PROXY_PROTOCOL})"
+fi
+# What we register; may be downgraded to none below if the TLS shim cannot start.
+PP_REG_MODE="$PP_MODE"
+HTTPS_PROXY_PORT_REG="null"
+# The state file (read by haproxy-register) is written ONLY once the shim
+# readiness decision is made (step 6a). Drop any copy left in /tmp by a previous
+# boot of this container so a re-announce in between cannot claim v2.
+write_pp_state() {
+    printf 'SSL_PP_REGISTERED_MODE=%s\nSSL_PP_HTTPS_PROXY_PORT=%s\n' "$PP_REG_MODE" "$HTTPS_PROXY_PORT_REG" > "$PP_STATE_FILE"
+}
+rm -f "$PP_STATE_FILE"
+# Registering v2 while the shim would drop/ignore haproxy's header (its real source
+# address is not in the trusted set) silently loses the real client IP, so prove
+# the trust set covers haproxy first. SSL_PP_SELFTEST_CMD is a test seam.
+pp_trust_selftest() {
+    local cmd="${SSL_PP_SELFTEST_CMD:-python3 /usr/local/lib/ssl-manager/proxyproto.py selftest}"
+    $cmd
+}
 
 # Parse domain aliases into an array
 ALL_SSL_DOMAINS=("$SSL_DOMAIN")
@@ -281,7 +351,8 @@ if [[ -n "$HAPROXY_DETECTED" ]]; then
         --arg container "$(hostname)" \
         --argjson http_port 80 \
         --argjson extra_ports "${EXTRA_PORTS:-null}" \
-        '{domain: $domain, container: $container, http_port: $http_port, https_port: null, extra_ports: $extra_ports}')
+        --arg pp "$PP_REG_MODE" \
+        '{domain: $domain, container: $container, http_port: $http_port, https_port: null, extra_ports: $extra_ports, proxy_protocol: $pp}')
 
     while [[ "$total_waited" -lt "$max_wait" ]]; do
         http_code=$(curl -s -o /dev/null -w '%{http_code}' \
@@ -334,7 +405,8 @@ if [[ -n "$HAPROXY_DETECTED" ]]; then
             --arg container "$(hostname)" \
             --argjson http_port 80 \
             --argjson extra_ports "${EXTRA_PORTS:-null}" \
-            '{domain: $domain, container: $container, http_port: $http_port, https_port: null, extra_ports: $extra_ports}')
+            --arg pp "$PP_REG_MODE" \
+            '{domain: $domain, container: $container, http_port: $http_port, https_port: null, extra_ports: $extra_ports, proxy_protocol: $pp}')
 
         _alias_registered=false
         for _attempt in 1 2 3; do
@@ -612,6 +684,47 @@ fi
 # Step 6: Re-register ALL domains with HAProxy including HTTPS port
 # ---------------------------------------------------------------------------
 if [[ -n "$HAPROXY_DETECTED" ]]; then
+    # Step 6a: PROXY-aware TLS shim. haproxy's :443 SNI passthrough (with a PROXY
+    # v2 header) goes to the shim, which forwards the untouched TLS stream to the
+    # app's SSL_HTTPS_PORT. If the shim cannot start we register WITHOUT PROXY
+    # protocol rather than let haproxy send a header to a listener that cannot
+    # take it.
+    if [[ "$PP_MODE" == "v2" ]]; then
+        if nc -z localhost "$SSL_PROXY_HTTPS_PORT" 2>/dev/null; then
+            warn "SSL_PROXY_HTTPS_PORT ${SSL_PROXY_HTTPS_PORT} is already in use -- registering WITHOUT PROXY protocol"
+            PP_REG_MODE="none"
+        else
+            /usr/local/bin/ssl-pp-proxy-wrapper \
+                --listen "$SSL_PROXY_HTTPS_PORT" \
+                --upstream "${SSL_PROXY_HTTPS_UPSTREAM:-auto:${SSL_HTTPS_PORT}}" &
+            PP_SHIM_PID=$!
+            echo "$PP_SHIM_PID" > /tmp/.ssl-pp-proxy-wrapper.pid
+            _shim_ready=false
+            for _ in $(seq 1 20); do
+                if nc -z localhost "$SSL_PROXY_HTTPS_PORT" 2>/dev/null; then _shim_ready=true; break; fi
+                kill -0 "$PP_SHIM_PID" 2>/dev/null || break   # wrapper gave up (config error, exit 2)
+                sleep 0.25
+            done
+            if [[ "$_shim_ready" == "true" ]]; then
+                HTTPS_PROXY_PORT_REG="$SSL_PROXY_HTTPS_PORT"
+                log "PROXY v2 TLS shim ready on :${SSL_PROXY_HTTPS_PORT} (PID ${PP_SHIM_PID})"
+                if ! pp_trust_selftest; then
+                    warn "PROXY trust self-test failed -- registering WITHOUT PROXY protocol"
+                    kill "$PP_SHIM_PID" 2>/dev/null || true
+                    PP_SHIM_PID=""
+                    PP_REG_MODE="none"
+                    HTTPS_PROXY_PORT_REG="null"
+                fi
+            else
+                warn "PROXY v2 TLS shim did not start -- registering WITHOUT PROXY protocol"
+                kill "$PP_SHIM_PID" 2>/dev/null || true
+                PP_SHIM_PID=""
+                PP_REG_MODE="none"
+            fi
+        fi
+    fi
+    write_pp_state   # after the readiness decision, whatever it was
+
     build_auth_header
     _haproxy_reregister_url="http://${HAPROXY_IP:-${HAPROXY_DETECTED}}:${HAPROXY_API_PORT}/v1/backends"
 
@@ -622,7 +735,9 @@ if [[ -n "$HAPROXY_DETECTED" ]]; then
         --argjson http_port 80 \
         --argjson https_port "${SSL_HTTPS_PORT}" \
         --argjson extra_ports "${EXTRA_PORTS:-null}" \
-        '{domain: $domain, container: $container, http_port: $http_port, https_port: $https_port, extra_ports: $extra_ports}')
+        --arg pp "$PP_REG_MODE" \
+        --argjson hpp "$HTTPS_PROXY_PORT_REG" \
+        '{domain: $domain, container: $container, http_port: $http_port, https_port: $https_port, extra_ports: $extra_ports, proxy_protocol: $pp, https_proxy_port: $hpp}')
 
     http_code=$(curl -s -o /dev/null -w '%{http_code}' \
         -X POST "$_haproxy_reregister_url" \
@@ -633,7 +748,7 @@ if [[ -n "$HAPROXY_DETECTED" ]]; then
     if [[ "$http_code" != "200" && "$http_code" != "201" ]]; then
         die 13 "HAProxy HTTPS registration failed for ${SSL_DOMAIN} (status=${http_code})"
     fi
-    log "Registered ${SSL_DOMAIN} with HAProxy (HTTPS port=${SSL_HTTPS_PORT})"
+    log "Registered ${SSL_DOMAIN} with HAProxy (HTTPS port=${SSL_HTTPS_PORT}, proxy_protocol=${PP_REG_MODE}, https_proxy_port=${HTTPS_PROXY_PORT_REG})"
 
     # Alias domains → same HTTPS port as primary (app handles SNI via nginx)
     for _reg_domain in "${ALL_SSL_DOMAINS[@]:1}"; do
@@ -643,7 +758,9 @@ if [[ -n "$HAPROXY_DETECTED" ]]; then
             --argjson http_port 80 \
             --argjson https_port "${SSL_HTTPS_PORT}" \
             --argjson extra_ports "${EXTRA_PORTS:-null}" \
-            '{domain: $domain, container: $container, http_port: $http_port, https_port: $https_port, extra_ports: $extra_ports}')
+            --arg pp "$PP_REG_MODE" \
+            --argjson hpp "$HTTPS_PROXY_PORT_REG" \
+            '{domain: $domain, container: $container, http_port: $http_port, https_port: $https_port, extra_ports: $extra_ports, proxy_protocol: $pp, https_proxy_port: $hpp}')
 
         http_code=$(curl -s -o /dev/null -w '%{http_code}' \
             -X POST "$_haproxy_reregister_url" \

@@ -19,6 +19,11 @@
 #   HAPROXY_API_PORT  — HAProxy API port (default: 8404)
 #   HAPROXY_API_KEY   — bearer token for API auth (optional)
 #   EXTRA_PORTS       — JSON array of extra port mappings (optional)
+#
+# PROXY protocol: the mode ssl-setup actually registered (proxy_protocol and
+# https_proxy_port, after checking that the TLS shim is up) is read from
+# /tmp/.ssl-proxy-protocol so a re-registration never flips it. Without that file
+# (ssl-setup not run) nothing PROXY-related is sent, i.e. legacy behaviour.
 
 set -euo pipefail
 
@@ -77,6 +82,19 @@ done
 BASE_URL="http://${HAPROXY_HOST}:${HAPROXY_API_PORT}/v1/backends"
 build_auth_header
 
+PP_REG_MODE="none"
+HTTPS_PROXY_PORT_REG="null"
+if [[ -f /tmp/.ssl-proxy-protocol ]]; then
+    _m=$(sed -n 's/^SSL_PP_REGISTERED_MODE=//p' /tmp/.ssl-proxy-protocol | head -1)
+    _p=$(sed -n 's/^SSL_PP_HTTPS_PROXY_PORT=//p' /tmp/.ssl-proxy-protocol | head -1)
+    # v2 is only valid together with the shim port ssl-setup verified; anything
+    # else (truncated/hand-edited file) is treated as "none".
+    if [[ "$_m" == "v2" && "$_p" =~ ^[0-9]+$ ]]; then
+        PP_REG_MODE="v2"
+        HTTPS_PROXY_PORT_REG="$_p"
+    fi
+fi
+
 # ---------------------------------------------------------------------------
 # Actions
 # ---------------------------------------------------------------------------
@@ -88,7 +106,9 @@ case "$ACTION" in
             --argjson http_port 80 \
             --argjson https_port "${SSL_HTTPS_PORT}" \
             --argjson extra_ports "${EXTRA_PORTS:-null}" \
-            '{domain: $domain, container: $container, http_port: $http_port, https_port: $https_port, extra_ports: $extra_ports}')
+            --arg pp "$PP_REG_MODE" \
+            --argjson hpp "$HTTPS_PROXY_PORT_REG" \
+            '{domain: $domain, container: $container, http_port: $http_port, https_port: $https_port, extra_ports: $extra_ports, proxy_protocol: $pp, https_proxy_port: $hpp}')
 
         http_code=$(curl -sf -o /tmp/.haproxy-register-response -w '%{http_code}' \
             -X POST "${BASE_URL}" \
@@ -119,7 +139,9 @@ case "$ACTION" in
                     --argjson http_port 80 \
                     --argjson https_port "${SSL_HTTPS_PORT}" \
                     --argjson extra_ports "${EXTRA_PORTS:-null}" \
-                    '{domain: $domain, container: $container, http_port: $http_port, https_port: $https_port, extra_ports: $extra_ports}')
+                    --arg pp "$PP_REG_MODE" \
+                    --argjson hpp "$HTTPS_PROXY_PORT_REG" \
+                    '{domain: $domain, container: $container, http_port: $http_port, https_port: $https_port, extra_ports: $extra_ports, proxy_protocol: $pp, https_proxy_port: $hpp}')
 
                 _code=$(curl -sf -o /dev/null -w '%{http_code}' \
                     -X POST "${BASE_URL}" -H "Content-Type: application/json" \

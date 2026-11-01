@@ -705,7 +705,14 @@ Key patterns from the Fulcrum integration:
 | `HAPROXY_HOST` | _(empty)_ | Hostname of the HAProxy container. If set, ssl-manager registers the service with HAProxy. If unset and a container named `haproxy` is resolvable via DNS, it is auto-detected. |
 | `HAPROXY_API_PORT` | `8404` | Port for the HAProxy Registration API. |
 | `HAPROXY_API_KEY` | _(empty)_ | Bearer token for API authentication. Sent as `Authorization: Bearer <key>`. |
-| `EXTRA_PORTS` | _(empty)_ | JSON array of extra port mappings for HAProxy. Each entry: `{"listen": <int>, "target": <int>, "mode": "tcp"|"http"}`. |
+| `EXTRA_PORTS` | _(empty)_ | JSON array of extra port mappings for HAProxy. Each entry: `{"listen": <int>, "target": <int>, "mode": "tcp"|"http", "proxy_protocol"?: "v2"|"none"}`. |
+| `SSL_PROXY_PROTOCOL` | `v2` | Accept PROXY protocol v2 from haproxy and register for it (`off` opts out; default `off` in remote tunnel mode). See "Real client IPs" below. |
+| `SSL_PROXY_TRUSTED_CIDRS` | `haproxy` | Peers allowed to send a PROXY header: `haproxy` = only the haproxy host (default, strict), `auto` = haproxy-net subnet, or CIDR/IP list. Headers from anyone else close the connection. Fails closed: the haproxy address is re-resolved at least every 10 s, and if the name does not resolve nothing is trusted. |
+| `SSL_PROXY_HAPROXY_ADDR` | _(empty)_ | Optional static haproxy IP/CIDR(s), trusted in addition to the DNS name (survives docker-DNS outages). |
+| `SSL_PROXY_HTTPS_PORT` | `8445` | Port of the PROXY-aware TLS shim haproxy's :443 passthrough is routed to (forwards to `SSL_HTTPS_PORT`). |
+| `SSL_PROXY_HTTPS_UPSTREAM` | `auto:$SSL_HTTPS_PORT` | Shim upstream. `auto` = this container's own non-loopback IP; if none is found the shim exits and ssl-setup registers `none`, it never silently dials 127.0.0.1. With an upstream PROXY protocol, use `127.0.0.1:<loopback-only PROXY listener>`. |
+| `SSL_PROXY_HTTPS_UPSTREAM_PROTOCOL` | `none` | `v2`/`v1`: shim re-emits the real client address to the app as a PROXY header (point the upstream at a dedicated PROXY listener of the app). That listener must be reachable **only by the shim** (bind it to 127.0.0.1 and accept only that source). |
+| `SSL_PROXY_LOG_CONNECTIONS` | `false` | Log the real client address of each shim connection. |
 
 ### Application Configuration
 
