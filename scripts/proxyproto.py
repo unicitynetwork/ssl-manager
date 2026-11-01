@@ -11,8 +11,12 @@ Rules this module implements (see haproxy repo docs/PROXY-PROTOCOL-V2-DESIGN.md)
   local health checks, a haproxy that does not send the header yet / any more).
 * A header is honoured ONLY when the TCP peer is trusted (TrustPolicy). A peer
   that is not trusted and starts with the signature is a spoofing attempt: the
-  caller must close the connection (never strip-and-continue, never pass the
-  bytes on to the application).
+  caller must NOT adopt it: a complete, well-formed header is stripped and the
+  connection is served as DIRECT (the claimed address is never adopted, logged
+  as a client or forwarded; the header bytes never reach the application), and
+  anything malformed after the signature is closed. Closing a well-formed header
+  would turn a trust mismatch (haproxy's real source address missing from the
+  trusted set) into a silent outage that haproxy's TCP check cannot see.
 * Only v2 is accepted. v1 ("PROXY TCP4 ...") is not parsed: haproxy is
   configured with send-proxy-v2 and accepting both widens the attack surface.
 * The header is bounded: payload length beyond max_payload is rejected.
@@ -389,6 +393,33 @@ def policy_from_env(env=os.environ) -> TrustPolicy:
     return TrustPolicy(spec=spec, haproxy_host=env.get("HAPROXY_HOST") or "haproxy")
 
 
+def trust_selftest(env=os.environ, resolver: Callable[[str], list] = _resolve_all,
+                   policy: Optional["TrustPolicy"] = None):
+    """Registration-time check that the shim/http-proxy would honour a header from
+    haproxy: (ok, reason). Fails (ok False) when the haproxy name does not resolve,
+    when an address it resolves to is not trusted, or when it resolves to several
+    addresses and nothing static pins which one it connects from (we cannot tell
+    which one it will use). On failure the caller registers proxy_protocol none."""
+    host = env.get("HAPROXY_HOST") or "haproxy"
+    try:
+        pol = policy or policy_from_env(env)
+        if policy is None:
+            pol._resolver = resolver
+        pol.refresh_now()
+        ips = pol._resolver(host)
+    except (ValueError, OSError) as e:
+        return False, f"trust policy invalid: {e}"
+    if not ips:
+        return False, f"haproxy host '{host}' does not resolve"
+    untrusted = [ip for ip in ips if not pol.is_trusted(ip)]
+    if untrusted:
+        return False, f"haproxy address(es) {', '.join(untrusted)} not in the trusted set ({pol.describe()})"
+    if len(ips) > 1 and not pol.static:
+        return False, (f"haproxy host '{host}' resolves to several addresses ({', '.join(ips)}); "
+                       f"cannot tell which one it connects from -- pin it with SSL_PROXY_HAPROXY_ADDR")
+    return True, f"haproxy {', '.join(ips)} trusted"
+
+
 def pp_enabled_from_env(env=os.environ) -> bool:
     v = (env.get("SSL_PROXY_PROTOCOL", "v2") or "v2").strip().lower()
     return v not in ("off", "none", "false", "0", "no", "disabled")
@@ -421,3 +452,12 @@ class RateLimitedLog:
             msg = f"{msg} (+{dropped} similar suppressed)"
         self.emit(msg)
 
+
+if __name__ == "__main__":
+    # `proxyproto.py selftest`: exit 0 iff headers from haproxy would be accepted.
+    if sys.argv[1:] == ["selftest"]:
+        _ok, _why = trust_selftest()
+        print(f"[proxyproto] PROXY trust self-test: {'OK' if _ok else 'FAILED'}: {_why}", flush=True)
+        raise SystemExit(0 if _ok else 1)
+    print("usage: proxyproto.py selftest", file=sys.stderr)
+    raise SystemExit(2)

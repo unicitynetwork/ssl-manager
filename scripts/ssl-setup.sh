@@ -214,6 +214,13 @@ write_pp_state() {
     printf 'SSL_PP_REGISTERED_MODE=%s\nSSL_PP_HTTPS_PROXY_PORT=%s\n' "$PP_REG_MODE" "$HTTPS_PROXY_PORT_REG" > "$PP_STATE_FILE"
 }
 rm -f "$PP_STATE_FILE"
+# Registering v2 while the shim would drop/ignore haproxy's header (its real source
+# address is not in the trusted set) silently loses the real client IP, so prove
+# the trust set covers haproxy first. SSL_PP_SELFTEST_CMD is a test seam.
+pp_trust_selftest() {
+    local cmd="${SSL_PP_SELFTEST_CMD:-python3 /usr/local/lib/ssl-manager/proxyproto.py selftest}"
+    $cmd
+}
 
 # Parse domain aliases into an array
 ALL_SSL_DOMAINS=("$SSL_DOMAIN")
@@ -701,6 +708,13 @@ if [[ -n "$HAPROXY_DETECTED" ]]; then
             if [[ "$_shim_ready" == "true" ]]; then
                 HTTPS_PROXY_PORT_REG="$SSL_PROXY_HTTPS_PORT"
                 log "PROXY v2 TLS shim ready on :${SSL_PROXY_HTTPS_PORT} (PID ${PP_SHIM_PID})"
+                if ! pp_trust_selftest; then
+                    warn "PROXY trust self-test failed -- registering WITHOUT PROXY protocol"
+                    kill "$PP_SHIM_PID" 2>/dev/null || true
+                    PP_SHIM_PID=""
+                    PP_REG_MODE="none"
+                    HTTPS_PROXY_PORT_REG="null"
+                fi
             else
                 warn "PROXY v2 TLS shim did not start -- registering WITHOUT PROXY protocol"
                 kill "$PP_SHIM_PID" 2>/dev/null || true

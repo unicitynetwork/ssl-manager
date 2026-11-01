@@ -354,13 +354,11 @@ class TestShim(unittest.TestCase):
         self.shim = ShimHarness("127.0.0.1", self.up.port)
         self.assertEqual(self.shim.talk(b"\x16\x03\x01plain\n"), b"ECHO:\x16\x03\x01plain\n")
 
-    def test_untrusted_header_is_rejected(self):
+    def test_untrusted_header_is_stripped_and_ignored(self):
         self.shim = ShimHarness("10.9.9.9", self.up.port)  # loopback is NOT trusted
-        out, elapsed = self.shim.talk_timed(pp.build_v2("6.6.6.6", 1, "7.7.7.7", 2) + b"evil\n")
-        self.assertEqual(out, b"")
-        self.assertLess(elapsed, 1.0, "must be an immediate close, not the 3s header timeout")
-        time.sleep(0.2)
-        self.assertEqual(self.up.received, [], "forged header must never reach the app")
+        out = self.shim.talk(pp.build_v2("6.6.6.6", 1, "7.7.7.7", 2) + b"evil\n")
+        self.assertEqual(out, b"ECHO:evil\n", "served as direct, not closed")
+        self.assertEqual(self.up.received, [b"evil\n"], "forged header must never reach the app")
 
     def test_untrusted_without_header_still_served(self):
         self.shim = ShimHarness("10.9.9.9", self.up.port)
@@ -504,11 +502,13 @@ class TestHttpProxy(unittest.TestCase):
         h = self.body(self.request(hdr, "x-forwarded-for: 6.6.6.6\r\n"))
         self.assertEqual(h["x-forwarded-for"], "203.0.113.7")
 
-    def test_untrusted_header_rejected(self):
+    def test_untrusted_header_stripped_and_ignored(self):
         self.set_policy(True, trusted="10.9.9.9")
-        raw, elapsed = self.request_timed(pp.build_v2("6.6.6.6", 1, "7.7.7.7", 80))
-        self.assertEqual(raw, b"")
-        self.assertLess(elapsed, 1.0, "must be an immediate close, not the 3s header timeout")
+        raw = self.request(pp.build_v2("6.6.6.6", 1, "7.7.7.7", 80), "X-Forwarded-For: 5.5.5.5\r\n")
+        h = self.body(raw)
+        self.assertEqual(h["x-real-ip"], "127.0.0.1")
+        self.assertEqual(h["x-forwarded-for"], "5.5.5.5, 127.0.0.1")  # direct => legacy append
+        self.assertNotIn(b"6.6.6.6", raw)
 
     def test_local_header_uses_peer_and_overwrites(self):
         # trusted header without an address: TCP peer, and client claims are DROPPED

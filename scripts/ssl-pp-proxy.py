@@ -8,9 +8,14 @@ PROXY v2 enabled, ssl-manager registers this shim's port as `https_proxy_port`:
 haproxy connects here and prepends a PROXY v2 header; the shim
 
   * honours the header only if the TCP peer is trusted (default "haproxy": only
-    the haproxy container's current address, see proxyproto.TrustPolicy), and
-    CLOSES a connection from an untrusted peer that starts with a PROXY
-    signature (spoofing attempt);
+    the haproxy container's current address, see proxyproto.TrustPolicy). A
+    well-formed header from an UNTRUSTED peer is stripped and IGNORED: the
+    connection is treated as direct (the real TCP peer is the client, the
+    claimed address is never adopted, logged as a client or forwarded). It is
+    deliberately not closed: if haproxy's real source address is missing from
+    the trusted set, closing would be a silent HTTPS outage that haproxy's TCP
+    health check cannot see, whereas stripping has no security cost (the header
+    bytes are never forwarded). Garbage after the signature is closed;
   * accepts connections WITHOUT a header too (header optional) -- so a haproxy
     that stops sending it (rollback) keeps working;
   * forwards the remaining byte stream unchanged (TLS stays end-to-end between
@@ -79,14 +84,18 @@ class Shim:
         self.upstream = upstream or resolve_upstream(args.upstream)
         self.sem = asyncio.Semaphore(args.max_connections)
         self.rl = pp.RateLimitedLog(warn, interval=1.0)
+        self.rl_untrusted = pp.RateLimitedLog(warn, interval=60.0)
         self.active = 0
+        self.untrusted_conns = {}  # peer ip -> open connections (untrusted peers only)
 
     async def _trusted(self, peer_ip) -> bool:
         # may hit DNS (re-resolution): keep it off the event loop
         return await asyncio.get_running_loop().run_in_executor(None, self.policy.is_trusted, peer_ip)
 
-    async def _read_header(self, reader, peer_ip):
-        """Return (info|None, leftover bytes) or raise ConnectionAbortedError to reject."""
+    async def _read_header(self, reader, peer_ip, trusted):
+        """Return (info|None, leftover bytes) or raise ConnectionAbortedError to reject.
+        A complete, well-formed header from an untrusted peer is consumed and
+        dropped (info None, logged once a minute per peer): never adopted."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.args.header_timeout
         buf = b""
@@ -104,26 +113,30 @@ class Shim:
             if not chunk:
                 raise ConnectionResetError("peer closed before sending data")
             buf += chunk
-            if pp.starts_with_signature_prefix(buf) and len(buf) >= pp.SIG_LEN \
-                    and not await self._trusted(peer_ip):
-                raise ConnectionAbortedError(f"PROXY header from UNTRUSTED peer {peer_ip} rejected")
             state, val = pp.classify(buf, self.args.max_header)
             if state == pp.NOT_PROXY:
                 return None, buf
             if state == pp.INVALID:
                 raise ConnectionAbortedError(f"invalid PROXY header from {peer_ip}: {val}")
             if state == pp.PROXY:
-                if not await self._trusted(peer_ip):  # signature split across reads
-                    raise ConnectionAbortedError(f"PROXY header from UNTRUSTED peer {peer_ip} rejected")
+                if not trusted:
+                    self.rl_untrusted(
+                        f"untrusted:{peer_ip}",
+                        f"PROXY header from untrusted peer {peer_ip} ignored; treating the "
+                        f"connection as direct (if this peer is haproxy, fix SSL_PROXY_TRUSTED_CIDRS "
+                        f"or SSL_PROXY_HAPROXY_ADDR)")
+                    return None, buf[val.header_len:]
                 return val, buf[val.header_len:]
             # NEED_MORE: loop
 
-    async def _pipe(self, reader, writer):
+    async def _pump(self, reader, writer, st):
         try:
             while True:
                 data = await reader.read(BUF)
                 if not data:
                     break
+                st["last"] = asyncio.get_running_loop().time()
+                st["seen"] = True
                 writer.write(data)
                 await writer.drain()
         except (ConnectionError, OSError):
@@ -135,6 +148,43 @@ class Shim:
             except (OSError, RuntimeError):
                 pass
 
+    async def _relay(self, reader, writer, up_reader, up_writer, seen):
+        """Pump both directions. Once either direction ends, the other gets
+        half_close_grace seconds, then both sides are closed (a half-open
+        connection must not hold a slot forever). Also closes after idle_timeout
+        seconds without bytes in either direction (0 disables), and after
+        header_timeout if no byte has flowed at all."""
+        loop = asyncio.get_running_loop()
+        st = {"last": loop.time(), "seen": seen}
+        pending = {asyncio.ensure_future(self._pump(reader, up_writer, st)),
+                   asyncio.ensure_future(self._pump(up_reader, writer, st))}
+        eof_at = None
+        try:
+            while pending:
+                now = loop.time()
+                limits = []
+                if eof_at is not None:
+                    limits.append(eof_at + self.args.half_close_grace)
+                limit = self.args.idle_timeout if st["seen"] else (
+                    self.args.header_timeout if not self.args.idle_timeout
+                    else min(self.args.idle_timeout, self.args.header_timeout))
+                if limit:
+                    limits.append(st["last"] + limit)
+                timeout = max(0.0, min(limits) - now) if limits else None
+                done, pending = await asyncio.wait(pending, timeout=timeout,
+                                                   return_when=asyncio.FIRST_COMPLETED)
+                now = loop.time()
+                if done and eof_at is None:
+                    eof_at = now
+                if eof_at is not None and now - eof_at >= self.args.half_close_grace:
+                    break
+                if limit and now - st["last"] >= limit:
+                    break
+        finally:
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
     async def handle(self, reader, writer):
         peer = writer.get_extra_info("peername") or ("?", 0)
         local = writer.get_extra_info("sockname") or ("0.0.0.0", 0)
@@ -143,11 +193,34 @@ class Shim:
             self.rl("full", f"max connections ({self.args.max_connections}) reached; rejecting {peer_ip}")
             writer.close()
             return
+        trusted = await self._trusted(peer_ip)
+        counted = False
+        if not trusted:
+            # Only untrusted/direct peers are capped per IP: haproxy is the one
+            # trusted peer and carries all traffic (bounded by the global limit).
+            cap = self.args.max_conn_per_untrusted_peer
+            if cap and self.untrusted_conns.get(peer_ip, 0) >= cap:
+                self.rl(f"peercap:{peer_ip}", f"per-peer limit ({cap}) reached; rejecting {peer_ip}")
+                writer.close()
+                return
+            self.untrusted_conns[peer_ip] = self.untrusted_conns.get(peer_ip, 0) + 1
+            counted = True
+        try:
+            await self._serve(reader, writer, peer, local, peer_ip, trusted)
+        finally:
+            if counted:
+                n = self.untrusted_conns.get(peer_ip, 0) - 1
+                if n > 0:
+                    self.untrusted_conns[peer_ip] = n
+                else:
+                    self.untrusted_conns.pop(peer_ip, None)
+
+    async def _serve(self, reader, writer, peer, local, peer_ip, trusted):
         async with self.sem:
             up_writer = None
             try:
                 try:
-                    info, leftover = await self._read_header(reader, peer_ip)
+                    info, leftover = await self._read_header(reader, peer_ip, trusted)
                 except ConnectionAbortedError as e:
                     self.rl(f"reject:{peer_ip}", str(e))
                     return
@@ -194,7 +267,7 @@ class Shim:
 
                 self.active += 1
                 try:
-                    await asyncio.gather(self._pipe(reader, up_writer), self._pipe(up_reader, writer))
+                    await self._relay(reader, writer, up_reader, up_writer, bool(leftover))
                 finally:
                     self.active -= 1
             except (ConnectionError, OSError) as e:
@@ -235,7 +308,15 @@ def parse_args(argv=None):
     p.add_argument("--upstream-proxy", choices=["none", "v1", "v2"],
                    default=(env.get("SSL_PROXY_HTTPS_UPSTREAM_PROTOCOL", "none") or "none").lower())
     p.add_argument("--trusted", default=None, help="override SSL_PROXY_TRUSTED_CIDRS")
-    p.add_argument("--header-timeout", type=float, default=float(env.get("SSL_PROXY_HEADER_TIMEOUT", "5")))
+    p.add_argument("--header-timeout", type=float, default=float(env.get("SSL_PROXY_HEADER_TIMEOUT", "10")),
+                   help="seconds to wait for a PROXY header / first byte (default 10)")
+    p.add_argument("--idle-timeout", type=float, default=float(env.get("SSL_PP_IDLE_TIMEOUT", "600")),
+                   help="close after this many seconds without bytes either way; 0 disables")
+    p.add_argument("--half-close-grace", type=float, default=float(env.get("SSL_PP_HALF_CLOSE_GRACE", "5")),
+                   help="seconds the other direction may linger once one side hit EOF")
+    p.add_argument("--max-conn-per-untrusted-peer", type=int,
+                   default=int(env.get("SSL_PP_MAX_CONN_PER_UNTRUSTED_PEER", "64")),
+                   help="concurrent connections per NON-trusted peer IP; 0 disables")
     p.add_argument("--connect-timeout", type=float, default=5.0)
     p.add_argument("--max-header", type=int, default=int(env.get("SSL_PROXY_MAX_HEADER", pp.DEFAULT_MAX_PAYLOAD)))
     p.add_argument("--max-connections", type=int, default=int(env.get("SSL_PROXY_MAX_CONNECTIONS", "4096")))

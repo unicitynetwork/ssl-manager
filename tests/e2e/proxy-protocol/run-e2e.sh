@@ -165,8 +165,7 @@ fi
 
 if [ "$EXPECT_PP" = "true" ]; then
     echo "== (c) forged PROXY headers"
-    # Prints the bytes received and how long the peer took to close. A rejection
-    # must be an IMMEDIATE close (well under the 5s header timeout), not a timeout.
+    # Prints the bytes received and how long the peer took to close.
     forge='import sys,socket,time;sys.path.insert(0,"/usr/local/lib/ssl-manager");import proxyproto as pp
 try:
     s=socket.create_connection((sys.argv[1],int(sys.argv[2])),timeout=3)
@@ -183,28 +182,29 @@ try:
 except Exception: pass
 el=time.monotonic()-t0
 print(("CLOSED" if not out else repr(out[:300]))+" %.2fs"%el)'
-    rejected() {  # name result
+    rejected() {  # name result -- an untrusted header is stripped and the connection served as
+        # DIRECT (never closed: a trust mismatch must not become a silent outage); what must
+        # never happen is the forged address surfacing in the response.
         case "$2" in
-            REFUSED) ok "$1 (refused)";;
-            CLOSED\ 0.*|CLOSED\ 1.*) ok "$1 (closed after ${2#CLOSED })";;
-            *) bad "$1" "got: $2 (want an immediate close)";;
+            *6.6.6.6*) bad "$1" "forged address 6.6.6.6 adopted/echoed: $2";;
+            *) ok "$1 (not adopted: ${2:0:60})";;
         esac
     }
     evil_ip=$(ip_of "$EVIL" "$APPNET"); evilha_ip=$(ip_of "$EVILHA" "$HANET")
     r=$(docker exec "$EVIL" python3 -c "$forge" "$(ip_of "$NEW" "$APPNET")" 80 'GET / HTTP/1.0\r\nHost: new.pp2.test\r\n\r\n')
-    rejected "untrusted peer (app net) forged header to :80 -> immediate close" "$r"
+    rejected "untrusted peer (app net) forged header to :80 -> stripped, treated as direct" "$r"
     r=$(docker exec "$EVIL" python3 -c "$forge" "$(ip_of "$NEW" "$APPNET")" 8445 'x')
-    rejected "untrusted peer (app net) forged header to TLS shim -> immediate close" "$r"
+    rejected "untrusted peer (app net) forged header to TLS shim -> stripped, treated as direct" "$r"
     # DEFAULT config ($NEW: no SSL_PROXY_TRUSTED_CIDRS set => "haproxy"): another
     # container ON haproxy-net is not haproxy and must be rejected too.
     r=$(docker exec "$EVILHA" python3 -c "$forge" "$NEW_HA_IP" 80 'GET / HTTP/1.0\r\nHost: new.pp2.test\r\n\r\n')
-    rejected "DEFAULT trust: forged header from a haproxy-net peer to :80 -> immediate close" "$r"
+    rejected "DEFAULT trust: forged header from a haproxy-net peer to :80 -> stripped, treated as direct" "$r"
     r=$(docker exec "$EVILHA" python3 -c "$forge" "$NEW_HA_IP" 8445 'x')
-    rejected "DEFAULT trust: forged header from a haproxy-net peer to TLS shim -> immediate close" "$r"
+    rejected "DEFAULT trust: forged header from a haproxy-net peer to TLS shim -> stripped, treated as direct" "$r"
     r=$(docker exec "$EVILHA" python3 -c "$forge" "$(ip_of "$NEW2" "$HANET")" 80 'GET / HTTP/1.0\r\nHost: new2.pp2.test\r\n\r\n')
-    rejected "strict trust + pinned addr: forged header from haproxy-net peer -> immediate close" "$r"
+    rejected "strict trust + pinned addr: forged header from haproxy-net peer -> stripped, treated as direct" "$r"
     for who in "$evil_ip" "$evilha_ip"; do
-        if docker logs "$NEW" 2>&1 | grep -q "UNTRUSTED peer $who rejected"; then ok "rejection of $who is logged"; else bad "rejection of $who not logged"; fi
+        if docker logs "$NEW" 2>&1 | grep -q "untrusted peer $who ignored"; then ok "ignoring header of $who is logged"; else bad "ignoring header of $who not logged"; fi
     done
     # The app-side PROXY listener (new2, 127.0.0.1:8446) must not be reachable by
     # anyone but the shim: a forged header straight to it is never adopted.
@@ -229,7 +229,7 @@ print(("CLOSED" if not out else repr(out[:300]))+" %.2fs"%el)'
     check "in-container localhost HTTP" "$(echo "$out" | j x_real_ip)" "127.0.0.1"
 
     echo "== (e) haproxy health checks + persistence"
-    stat=$(docker exec "$HAP" sh -c 'echo "show stat" | socat stdio /var/run/haproxy.sock' | cut -d, -f1,2,18 | grep pp2test-new)
+    stat=$(docker exec "$HAP" sh -c 'echo "show stat" | socat stdio /var/run/haproxy.sock' | cut -d, -f1,2,18 | grep "${PREFIX}-new")
     echo "$stat" | sed 's/^/     /'
     for be in "${NEW}-http-pp" "${NEW}-https-8445-pp" "${NEW2}-http-pp" "${NEW2}-https-8445-pp"; do
         case "$stat" in *"$be,$NEW"*UP*|*"$be,$NEW2"*UP*) ok "health UP: $be";; *) bad "health not UP: $be";; esac
