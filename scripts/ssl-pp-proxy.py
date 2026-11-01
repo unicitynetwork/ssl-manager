@@ -125,8 +125,14 @@ class Shim:
                         f"PROXY header from untrusted peer {peer_ip} ignored; treating the "
                         f"connection as direct (if this peer is haproxy, fix SSL_PROXY_TRUSTED_CIDRS "
                         f"or SSL_PROXY_HAPROXY_ADDR)")
-                    return None, buf[val.header_len:]
-                return val, buf[val.header_len:]
+                    rest = buf[val.header_len:]
+                    if rest[:pp.SIG_LEN] == pp.SIGNATURE:
+                        raise ConnectionAbortedError(f"second PROXY header from untrusted peer {peer_ip}")
+                    return None, rest
+                rest = buf[val.header_len:]
+                if rest[:pp.SIG_LEN] == pp.SIGNATURE:
+                    raise ConnectionAbortedError(f"second PROXY header from trusted peer {peer_ip}")
+                return val, rest
             # NEED_MORE: loop
 
     async def _pump(self, reader, writer, st):
@@ -164,7 +170,9 @@ class Shim:
                 now = loop.time()
                 limits = []
                 if eof_at is not None:
-                    limits.append(eof_at + self.args.half_close_grace)
+                    # grace counts from the last byte after the EOF, so a transfer
+                    # that is still flowing is not cut off
+                    limits.append(max(eof_at, st["last"]) + self.args.half_close_grace)
                 limit = self.args.idle_timeout if st["seen"] else (
                     self.args.header_timeout if not self.args.idle_timeout
                     else min(self.args.idle_timeout, self.args.header_timeout))
@@ -176,7 +184,7 @@ class Shim:
                 now = loop.time()
                 if done and eof_at is None:
                     eof_at = now
-                if eof_at is not None and now - eof_at >= self.args.half_close_grace:
+                if eof_at is not None and now - max(eof_at, st["last"]) >= self.args.half_close_grace:
                     break
                 if limit and now - st["last"] >= limit:
                     break

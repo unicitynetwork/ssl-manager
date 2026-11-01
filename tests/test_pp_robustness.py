@@ -302,6 +302,66 @@ class TestLeaksAndTimeouts(unittest.TestCase):
         self.assertEqual(self.h.shim.untrusted_conns, {})
 
 
+class StreamingUpstream(Upstream):
+    """After the client's first bytes + EOF, streams N chunks, one every `gap` seconds."""
+
+    def __init__(self, chunks, gap):
+        self.chunks, self.gap = chunks, gap
+        super().__init__()
+
+    def _serve(self, c):
+        try:
+            while True:
+                d = c.recv(4096)
+                if not d:
+                    break  # client half-closed (EOF)
+            for _ in range(self.chunks):
+                time.sleep(self.gap)
+                c.sendall(b"X" * 100)
+            c.close()
+        except OSError:
+            pass
+
+
+class TestHalfCloseAndSecondHeader(unittest.TestCase):
+    def tearDown(self):
+        self.up.close()
+        self.h.close()
+
+    def test_half_close_grace_counts_from_last_byte(self):
+        # client half-closes, upstream then streams for ~2.4s with grace 0.6s:
+        # a still-flowing transfer must NOT be cut off
+        self.up = StreamingUpstream(chunks=8, gap=0.3)
+        self.h = Harness("127.0.0.1", self.up.port, half_close_grace=0.6,
+                         idle_timeout=0, header_timeout=5)
+        s = self.h.connect()
+        s.sendall(b"req")
+        s.shutdown(socket.SHUT_WR)
+        got = b""
+        s.settimeout(6)
+        try:
+            while True:
+                d = s.recv(4096)
+                if not d:
+                    break
+                got += d
+        except OSError:
+            pass
+        self.assertEqual(len(got), 800, len(got))
+
+    def test_second_header_after_first_is_closed(self):
+        self.up = Upstream()
+        for trusted, peer in (("10.9.9.9", "untrusted"), ("127.0.0.1", "trusted")):
+            self.h = Harness(trusted, self.up.port)
+            s = self.h.connect()
+            h1 = pp.build_v2("203.0.113.7", 1, "7.7.7.7", 2)
+            s.sendall(h1 + pp.build_v2("6.6.6.6", 1, "7.7.7.7", 2) + b"hi\n")
+            self.assertTrue(closed_within(s, 2.0), peer)
+            self.assertFalse(any(b"6.6.6.6" in r or b"hi" in r for r in self.up.received), peer)
+            self.h.close()
+        self.h = Harness("127.0.0.1", self.up.port)  # tearDown closes it
+
+
 class TestRegistrationFallback(unittest.TestCase):
     SETUP = os.path.join(SCRIPTS, "ssl-setup.sh")
 
