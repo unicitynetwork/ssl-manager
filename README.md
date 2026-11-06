@@ -157,10 +157,16 @@ Registration payload:
 
 ### Certificate Renewal
 
-A background loop runs every ~12 hours and calls `certbot renew`. When a certificate is renewed:
-1. The deploy hook touches `/tmp/.ssl-renewal-restart`
-2. Your entrypoint's supervisor loop detects this and restarts the app process
-3. The app picks up the new certificate files
+A background loop runs every ~12 hours and calls `certbot renew`. When a certificate is
+renewed, the deploy hook (`ssl-renewal-hook`) does two things:
+1. Touches `/tmp/.ssl-renewal-restart` so a marker-watching supervisor can reload, **and**
+2. Runs `SSL_RELOAD_CMD` if set.
+
+> **Important:** a cert renewed on disk is **not** live until your app reloads it. A
+> long-running app that loaded its cert at startup keeps serving the **old (eventually
+> expired)** cert until something reloads it. Either watch the marker in your supervisor
+> loop **or** set `SSL_RELOAD_CMD` to a self-resolving reload command, e.g.
+> `SSL_RELOAD_CMD="pkill -HUP -x myapp"`. If you do neither, renewal silently has no effect.
 
 ## Environment Variables
 
@@ -173,6 +179,7 @@ A background loop runs every ~12 hours and calls `certbot renew`. When a certifi
 | `SSL_CERT_RENEW_DAYS` | No | `30` | Renew cert if expiring within N days |
 | `SSL_STAGING` | No | (empty) | Set to `true` for Let's Encrypt staging (test certs) |
 | `SSL_TEST_MODE` | No | (empty) | Set to `true` to use self-signed cert (dev/CI only) |
+| `SSL_RELOAD_CMD` | No | (empty) | Command run by the renewal deploy hook when a cert is renewed, so the app reloads the new cert without a marker-watcher. Make it self-resolving (e.g. `pkill -HUP -x myapp` or `kill -HUP "$(cat /run/myapp.pid)"`); the marker is still touched regardless |
 | `HAPROXY_HOST` | No | (empty) | HAProxy container hostname. If unset, no HAProxy integration |
 | `HAPROXY_API_PORT` | No | `8404` | HAProxy Registration API port |
 | `HAPROXY_API_KEY` | No | (empty) | Bearer token for HAProxy API authentication |

@@ -129,7 +129,7 @@ while true; do
     if certbot renew \
         --webroot \
         --webroot-path "$WEBROOT" \
-        --deploy-hook "touch /tmp/.ssl-renewal-restart" \
+        --deploy-hook "/usr/local/bin/ssl-renewal-hook" \
         2>&1 | tee -a /var/log/certbot-renew.log; then
         log "Renewal check complete"
         _certbot_failures=0
@@ -142,9 +142,15 @@ while true; do
     # Log current certificate expiry after each check
     log_cert_expiry
 
-    # Check if the deploy hook fired (cert was actually renewed)
+    # Check if the deploy hook fired (cert was actually renewed). The hook
+    # (ssl-renewal-hook) has already touched the marker and run SSL_RELOAD_CMD
+    # if configured; a marker-watching supervisor will pick it up on its next tick.
     if [[ -f /tmp/.ssl-renewal-restart ]]; then
-        log "Certificate was renewed — service should be restarted to load new cert"
+        if [[ -n "${SSL_RELOAD_CMD:-}" ]]; then
+            log "Certificate renewed — marker touched and SSL_RELOAD_CMD invoked to reload"
+        else
+            log "Certificate renewed — marker touched; relying on the app's supervisor to reload (set SSL_RELOAD_CMD to reload automatically)"
+        fi
     fi
 
     # Sleep ~12 hours with random jitter (0-1800 seconds / 0-30 minutes)
